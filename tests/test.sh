@@ -97,6 +97,30 @@ sed -i 's/^main both/main pull/' "$conf"; rm "$P/fromhere.ics"; check "regen to 
 refuse "a removal in Google is not undone" test -e "$P/fromhere.ics"; refuse "and arrives here" test -e "$L/main/fromhere.ics"
 is "Google as before" "$(ls "$P" | grep -c ics)" "$before"
 
+# ---- links to events
+printf 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:X\r\nBEGIN:STANDARD\r\nDTSTART:19700101T000000\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:odd id)(x@goo\r\n gle.com\r\nDTSTART;TZID=X:20270111T090000\r\nSUMMARY:Committee\\, [big] \r\n meeting\r\nLOCATION:SCEN 421\r\nBEGIN:VALARM\r\nUID:alarm\r\nSUMMARY:no\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n' > "$S/lk.ics"
+printf 'BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ad\r\nDTSTART;VALUE=DATE:20270301\r\nSUMMARY:All day thing\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n' > "$S/ad.ics"
+printf 'BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ut\r\nDTSTART:20270302T020000Z\r\nSUMMARY:In UTC\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n' > "$S/ut.ics"
+check "sync" "$GS" sync a
+out=$("$GS" find COMMITTEE); link=$(grep -o 'calendar-event:[^)]*' <<<"$out" || true)
+is "find: the link" "$link" "calendar-event:odd%20id%29%28x@google.com?date=2027-01-11"
+[[ $out == *"[Committee, big meeting]("* ]] && ok "find: the title" || fail "title: $out"
+refuse "find nothing" "$GS" find nosuchevent
+is "open" "$("$GS" open "$link" --print | paste -sd'|')" "2027-01-11 09:00  Committee, [big] meeting (SCEN 421)|https://calendar.google.com/calendar/r/day/2027/1/11"
+is "all day" "$("$GS" open 'calendar-event:ad' --print | head -1)" "2027-03-01  All day thing"
+is "kept in UTC" "$(TZ=America/Chicago "$GS" open 'calendar-event:ut' --print | paste -sd'|')" "2027-03-01 20:00  In UTC|https://calendar.google.com/calendar/r/day/2027/3/1"
+sed -i 's/20270111/20270215/' "$S/lk.ics"; check "moved" "$GS" sync a
+is "the link follows" "$("$GS" open "$link" --print | tail -1)" "https://calendar.google.com/calendar/r/day/2027/2/15"
+rm "$S"/{lk,ad,ut}.ics; check "removed" "$GS" sync a
+out=$("$GS" open "$link" --print 2>&1) && fail "a removed event: should say so" || { [[ $out == *"not here"*"/day/2027/1/11"* ]] && ok "a removed event: its old date" || fail "$out"; }
+for bad in 'calendar-event:x y' 'calendar-event:x?date=2027-01-11;id' 'calendar-event:$(id)' 'https://evil' 'calendar-event:%zz' 'calendar-event:x%' ''; do refuse "refused: $bad" "$GS" open "$bad" --print; done
+mkdir -p "$T/fake"; printf '#!/bin/sh\necho "$@" >> %s/opened\n' "$T" | tee "$T/fake/xdg-open" "$T/fake/notify-send" "$T/fake/xdg-mime" >/dev/null; chmod +x "$T/fake"/*
+PATH=$T/fake:$PATH "$GS" open 'calendar-event:gone?date=2027-05-06' >/dev/null 2>&1 || true
+check "opens the browser" grep -q '^https://calendar.google.com/calendar/r/day/2027/5/6$' "$T/opened"
+ln -s "$(command -v "${VDIRSYNCER:-vdirsyncer}")" "$T/fake/vdirsyncer"
+PATH=$T/fake:$PATH "$GS" install >/dev/null 2>&1; check "install: the program for the links" grep -q 'default gcalendar-sync-open.desktop x-scheme-handler/calendar-event' "$T/opened"
+check "its desktop file" grep -q "^Exec=\"$HOME/.local/bin/gcalendar-sync\" open %u" "$HOME/.local/share/applications/gcalendar-sync-open.desktop"
+
 # ---- a calendar that becomes empty
 mkdir "$T/google/tiny@group"; ev "$T/google/tiny@group" only "Only one"
 check "add" "$GS" add a tiny tiny@group both; check "sync" "$GS" sync a

@@ -65,6 +65,11 @@ Sync
   sync ACCOUNT --quick    only two-way calendars with local changes; none: do nothing
   status [ACCOUNT]        the situation, problems, and what to do next
 
+Links to events (for notes: calendar-event:UID?date=YYYY-MM-DD)
+  find TEXT               events with TEXT in the title: date, title and link
+  open LINK [--print]     open the event's day in Google Calendar and show the event;
+                          installed as the program for such links
+
 Backup (git)
   backup ACCOUNT          commit the current state now (and push)
   history ACCOUNT [N]     the last N backup commits (default 20)
@@ -86,9 +91,26 @@ EOT
 
 # ------------------------------------------------------------ command help ---
 # One entry per command: its synopsis, then what it does.
-COMMANDS=(setup install uninstall init recover set-client authorize list-calendars add remove sync timers regen move accounts status backup history restore git maint enable-timers disable-timers log)
+COMMANDS=(find open setup install uninstall init recover set-client authorize list-calendars add remove sync timers regen move accounts status backup history restore git maint enable-timers disable-timers log)
 command_help() {
     case $1 in
+        find) cat <<'EOH'
+usage: gcalendar-sync find TEXT
+
+Events of all accounts with TEXT in the title (upper and lower case alike): date, title, and a
+Markdown link to paste into a note. Newest first, at most 50.
+EOH
+        ;;
+        open) cat <<'EOH'
+usage: gcalendar-sync open LINK [--print]
+
+LINK is calendar-event:UID?date=YYYY-MM-DD (what find prints). Looks the event up by its UID
+in the calendars here, shows it in a notification, and opens the day it is on now in Google
+Calendar. The date in the link is used only when the event is not here any more.
+  --print   only print the event and the address
+install makes it the program that opens such links (xdg-mime).
+EOH
+        ;;
         setup) cat <<'EOH'
 usage: gcalendar-sync setup [ACCOUNT]
 
@@ -1234,6 +1256,108 @@ EOT
     echo; status_one "$ACCT"
 }
 
+# ------------------------------------------------------------- event links ---
+# events_table — every event here, one per line: DATE <TAB> TIME <TAB> UID <TAB> TITLE <TAB> PLACE.
+# (the first VEVENT of a file; texts of others: control characters are removed)
+events_table() {
+    local a
+    while IFS= read -r a; do
+        ( load_account "$a"; for n in "${NAMES[@]}"; do find "$CALENDARS/$n" -maxdepth 1 -type f -name '*.ics' -print0; done ) 2>/dev/null
+    done < <(cmd_accounts) | xargs -0 -r awk '
+        function val(s) { sub(/^[^:]*:/, "", s); return s }
+        function txt(s) { s = val(s); gsub(/\\[nN]/, " ", s); gsub(/\\,/, ",", s); gsub(/[\\];/, ";", s); gsub(/\\\\/, "\\", s); gsub(/[[:cntrl:]]/, " ", s); return s }
+        function line(s) {
+            if (s == "BEGIN:VEVENT") { in_ev = !seen; depth = 0; return }
+            if (!in_ev) return
+            if (s == "END:VEVENT") { in_ev = 0; seen = 1; return }
+            if (s ~ /^BEGIN:/) depth++
+            if (s ~ /^END:/) { depth--; return }
+            if (depth) return
+            if (s ~ /^UID[:;]/) uid = val(s)
+            else if (s ~ /^SUMMARY[:;]/) title = txt(s)
+            else if (s ~ /^LOCATION[:;]/) place = txt(s)
+            else if (s ~ /^DTSTART[:;]/) start = val(s)
+        }
+        function done_file() {
+            if (held != "") line(held)
+            if (uid != "" && start != "")
+                printf "%s-%s-%s\t%s%s\t%s\t%s\t%s\n", substr(start,1,4), substr(start,5,2), substr(start,7,2),
+                    (length(start) > 8 ? substr(start,10,2) ":" substr(start,12,2) : "-"), (start ~ /Z$/ ? "Z" : ""), uid, (title == "" ? "(no title)" : title), place
+            held = uid = title = place = start = ""; seen = in_ev = 0
+        }
+        FNR == 1 && NR > 1 { done_file() }
+        { sub(/\r$/, "") }
+        /^[ \t]/ { held = held substr($0, 2); next }
+        { if (held != "") line(held); held = $0 }
+        END { done_file() }' |
+    # a time kept in UTC becomes a local one
+    while IFS=$'\t' read -r d c uid title place; do
+        if [[ $c == *Z ]]; then read -r d c < <(date -d "$d ${c%Z} UTC" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$d ${c%Z}"); fi
+        printf '%s\t%s\t%s\t%s\t%s\n' "$d" "$c" "$uid" "$title" "$place"
+    done
+}
+urlencode() {
+    local LC_ALL=C s=$1 i ch
+    for (( i = 0; i < ${#s}; i++ )); do
+        ch=${s:i:1}
+        case $ch in [A-Za-z0-9.@_-]) printf '%s' "$ch" ;; *) printf '%%%02X' "'$ch" ;; esac
+    done
+}
+cmd_find() {
+    local want=${*,,} d c uid title place n=0
+    [[ -n $want ]] || bad_usage "what to look for is missing"
+    while IFS=$'\t' read -r d c uid title place; do
+        [[ ${title,,} == *"$want"* ]] || continue
+        [[ $c != - ]] || c=
+        (( ++n <= 50 )) || { echo "... and more"; break; }
+        printf '%s %-5s  %s\n    [%s](calendar-event:%s?date=%s)\n' "$d" "$c" "$title" "${title//[\[\]]/}" "$(urlencode "$uid")" "$d"
+    done < <(events_table | tr '\t' '\034' | sort -r | tr '\034' '\t')
+    (( n )) || { info "no event with '$*' in its title"; return 1; }
+}
+cmd_open() {
+    local link=${1:-} only=${2:-} uid date= d c u title place found=no url
+    [[ -z $only || $only == --print ]] || bad_usage "unknown option '$only'"
+    # A link can come from anywhere: only this shape, nothing else of it is used.
+    [[ $link =~ ^calendar-event:([A-Za-z0-9.@_%+-]{1,400})(\?date=([0-9]{4}-[0-9]{2}-[0-9]{2}))?$ ]] \
+        || bad_usage "not an event link (calendar-event:UID?date=YYYY-MM-DD): $link"
+    uid=${BASH_REMATCH[1]} date=${BASH_REMATCH[3]:-}
+    [[ ! $uid =~ %($|.$|[^0-9A-Fa-f]|.[^0-9A-Fa-f]) ]] || bad_usage "not an event link: $link"
+    printf -v uid '%b' "${uid//%/\\x}"
+    while IFS=$'\t' read -r d c u title place; do
+        [[ $u == "$uid" ]] && { found=yes; date=$d; break; }
+    done < <(events_table)
+    if [[ $found == yes ]]; then
+        [[ $c != - ]] || c=
+        printf '%s%s  %s%s\n' "$date" "${c:+ $c}" "$title" "${place:+ ($place)}"
+        [[ $only == --print ]] || { command -v notify-send >/dev/null && notify-send -a "$PROG" -- "$title" "$date${c:+ $c}${place:+
+$place}" 2>/dev/null; } || true
+    else
+        warn "this event is not here (deleted, or its calendar is not synced)"
+        [[ $only == --print || -z $date ]] || { command -v notify-send >/dev/null && notify-send -a "$PROG" "Event not found" "Opening $date, the date in the link" 2>/dev/null; } || true
+    fi
+    [[ -n $date ]] && date -d "$date" >/dev/null 2>&1 || return 1
+    url=https://calendar.google.com/calendar/r/day/$(date -d "$date" +%Y/%-m/%-d)
+    printf '%s\n' "$url"
+    [[ $only == --print ]] || xdg-open "$url" >/dev/null 2>&1 || die "could not open a browser; the address is above"
+    [[ $found == yes ]]
+}
+install_link_handler() {
+    local d=${XDG_DATA_HOME:-$HOME/.local/share}/applications
+    mkdir -p -- "$d"
+    cat > "$d/$PROG-open.desktop" <<EOT
+[Desktop Entry]
+Type=Application
+Name=Calendar event link
+Exec="$BIN_DIR/$PROG" open %u
+NoDisplay=true
+Terminal=false
+MimeType=x-scheme-handler/calendar-event;
+EOT
+    update-desktop-database "$d" 2>/dev/null || true
+    xdg-mime default "$PROG-open.desktop" x-scheme-handler/calendar-event 2>/dev/null \
+        || warn "links to events are not set up: xdg-mime is missing or failed (gcalendar-sync open LINK works)"
+}
+
 # ----------------------------------------------------------------- install ---
 UNITS=("$PROG@.service" "$PROG@.timer" "$PROG-quick@.service" "$PROG-watch@.path" "$PROG-maint@.service" "$PROG-maint@.timer")
 install_dirs() { BIN_DIR=$HOME/.local/bin; DOC_DIR=$HOME/.local/share/doc/$PROG; }
@@ -1250,6 +1374,7 @@ cmd_install() {
     install -m 644 "$SELF_DIR/README.md" "$DOC_DIR/"
     systemctl --user daemon-reload 2>/dev/null || true
     for a in $(cmd_accounts); do "$BIN_DIR/$PROG" regen "$a"; done
+    install_link_handler
     info "installed to $BIN_DIR"
     printf '\nNext:  %s\n       (shows the situation and what to do)\n' "$PROG"
 }
@@ -1258,7 +1383,8 @@ cmd_uninstall() {
     local a
     for a in $(cmd_accounts); do cmd_disable_timers "$a"; done
     info "timers are off; now delete these (settings, calendars and backups are not among them):"
-    printf '  %s\n' "$BIN_DIR/$PROG" "$BIN_DIR/$PROG-secret" "${UNITS[@]/#/$UNIT_DIR/}" "$UNIT_DIR/$PROG-watch@*.path.d/" "$DOC_DIR/"
+    printf '  %s\n' "$BIN_DIR/$PROG" "$BIN_DIR/$PROG-secret" "${UNITS[@]/#/$UNIT_DIR/}" "$UNIT_DIR/$PROG-watch@*.path.d/" "$DOC_DIR/" \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/applications/$PROG-open.desktop"
 }
 
 run_command "$@"

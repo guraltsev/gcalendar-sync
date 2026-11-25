@@ -28,6 +28,9 @@ gcalendar-sync setup
 `setup` guides you through everything: the account, Google's registration (a Personal mode app, explained step by step with links), the
 sign-in, choosing calendars, the first sync, the timers. Stop at any time; run it again to continue.
 
+To upgrade, run `gcalendar-sync install` from anywhere: the checkout is remembered. It fetches and says when upstream is newer;
+`gcalendar-sync install --ff` pulls (fast-forward only) and installs that, and says what to solve where that is not possible.
+
 Lost? `gcalendar-sync` alone (or `status`) shows which steps are done, what is wrong, and the command to run next.
 `gcalendar-sync help`, and `COMMAND --help`, for the rest. With one account its name may be left out.
 

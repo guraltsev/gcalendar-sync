@@ -36,7 +36,9 @@ usage: gcalendar-sync COMMAND [ACCOUNT] [ARGS]      (ACCOUNT may be left out if 
                                                      where no other plain argument follows)
 
 Program
-  install                 install or upgrade for this user; run it from a checkout
+  install [--ff]          install or upgrade for this user, from the source checkout (the
+                          first time: ./gcalendar-sync install there; it is remembered).
+                          Says when upstream is newer; --ff pulls that first
   uninstall               turn the timers off and list the installed files to delete
 
 Setup
@@ -125,9 +127,13 @@ what it needs; stop at any time (Ctrl-C) and run it again to continue:
 EOH
         ;;
         install) cat <<'EOH'
-usage: gcalendar-sync install
+usage: gcalendar-sync install [--ff]
 
-Install or upgrade for this user. Run it from a checkout: ./gcalendar-sync install
+Install or upgrade for this user, from the source checkout: the one this program is in
+or linked to, else the one it was last installed from. Run it there the first time:
+./gcalendar-sync install
+It fetches, and says when upstream has newer commits.
+  --ff   bring the checkout up to date first (fast-forward only), then install
 EOH
         ;;
         uninstall) cat <<'EOH'
@@ -1361,21 +1367,100 @@ EOT
 # ----------------------------------------------------------------- install ---
 UNITS=("$PROG@.service" "$PROG@.timer" "$PROG-quick@.service" "$PROG-watch@.path" "$PROG-maint@.service" "$PROG-maint@.timer")
 install_dirs() { BIN_DIR=$HOME/.local/bin; DOC_DIR=$HOME/.local/share/doc/$PROG; }
+is_checkout() {
+    [[ $1 != "$(readlink -m -- "$BIN_DIR")" && -x $1/$PROG && -f $1/README.md && -f $1/systemd/${UNITS[0]} ]]
+}
+
+# check_upstream SRC — fetch and compare: UP is the upstream branch ('' when there is none to
+# compare with, then UP_WHY), BEHIND and AHEAD count commits. It changes no files.
+UP= UP_WHY= BEHIND=0 AHEAD=0
+sgit() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE git -C "$1" "${@:2}"; }
+check_upstream() {
+    local src=$1 remote out
+    if [[ $(sgit "$src" rev-parse --show-toplevel 2>/dev/null) != "$(readlink -f -- "$src")" ]]; then
+        UP_WHY="$src is not a git repository"; return 0
+    fi
+    if ! UP=$(sgit "$src" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null); then
+        UP= UP_WHY="the branch checked out in $src has no upstream"; return 0
+    fi
+    remote=$(sgit "$src" config "branch.$(sgit "$src" symbolic-ref --short HEAD).remote" || true)
+    if [[ -n $remote && $remote != . ]] &&
+       ! out=$(GIT_TERMINAL_PROMPT=0 timeout --foreground 30 env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE git -C "$src" fetch --quiet "$remote" 2>&1); then
+        UP= UP_WHY="could not ask upstream: $(head -n 1 <<<"${out:-no answer in 30 s}")"; return 0
+    fi
+    read -r AHEAD BEHIND < <(sgit "$src" rev-list --left-right --count "HEAD...$UP")
+}
+
+# pull_ff SRC — fast-forward to UP. 1 = nothing to pull; dies when it is not possible.
+pull_ff() {
+    local src=$1 out
+    [[ -n $UP ]] || die "install --ff: $UP_WHY; nothing was installed (without --ff the checkout is installed as it is)"
+    (( BEHIND )) || { info "already up to date with $UP"; return 1; }
+    if (( AHEAD )); then
+        die "install --ff: $src has $AHEAD commit(s) of its own and lacks $BEHIND of $UP, so it cannot fast-forward. Solve it there (git rebase or git merge), then run install again; nothing was installed"
+    fi
+    if ! out=$(sgit "$src" merge --ff-only --quiet "$UP" 2>&1); then
+        printf '%s\n' "$out" >&2
+        die "install --ff: local changes in $src are in the way (see above). Commit, stash or undo them there, then run it again; nothing was installed"
+    fi
+    info "pulled $BEHIND commit(s) from $UP"
+}
+
+# upstream_hint SRC — after an install without --ff.
+upstream_hint() {
+    local src=$1 n
+    n=$(sgit "$src" status --porcelain --untracked-files=no 2>/dev/null | wc -l) || n=0
+    (( n == 0 )) || info "note: $src has $n file(s) with uncommitted changes; they were installed too"
+    if [[ $UP_WHY == 'could not ask'* ]]; then warn "$UP_WHY"; fi
+    [[ -n $UP ]] && (( BEHIND )) || return 0
+    if (( AHEAD )); then
+        warn "$UP has $BEHIND newer commit(s), but $src has $AHEAD of its own: solve it there (git rebase or git merge), then install again"
+    else
+        warn "$UP has $BEHIND newer commit(s), not installed:"
+        sgit "$src" log --no-merges --format='  %s' -n 5 "HEAD..$UP" >&2
+        warn "to pull and install them: $PROG install --ff"
+    fi
+}
+
 cmd_install() {
+    local src u dep a ff=no f
+    while (( $# )); do
+        case $1 in --ff) ff=yes ;; *) die "install: unknown argument '$1' (only --ff)" ;; esac
+        shift
+    done
     install_dirs
-    local u dep a
-    [[ -f $SELF_DIR/README.md && -f $SELF_DIR/systemd/${UNITS[0]} ]] || die "install: run ./$PROG install in a source checkout"
+    src=$SELF_DIR
+    if ! is_checkout "$src"; then       # the installed copy: the checkout it came from does it
+        src=$(cat -- "$DOC_DIR/source" 2>/dev/null || true)
+        [[ -n $src ]] || die "install: it is not recorded where this copy was installed from; run ./$PROG install once in the source checkout, after that it works from anywhere"
+        is_checkout "$src" || die "install: the source checkout was $src, which is not there any more; run ./$PROG install once in the new place"
+        info "installing from $src"
+        if [[ $ff == yes ]]; then exec "$src/$PROG" install --ff; fi
+        exec "$src/$PROG" install
+    fi
+    if [[ -z ${GCALENDAR_SYNC_PULLED:-} ]]; then
+        check_upstream "$src"
+        if [[ $ff == yes ]] && pull_ff "$src"; then
+            # what was pulled does the installing
+            GCALENDAR_SYNC_PULLED=1 exec "$src/$PROG" install
+        fi
+    fi
     for dep in vdirsyncer systemd-creds flock git tar; do
         command -v "$dep" >/dev/null || die "missing dependency: $dep (sudo dnf install vdirsyncer git)"
     done
     install -d -m 755 "$BIN_DIR" "$UNIT_DIR" "$DOC_DIR"
-    install -m 755 "$SELF_DIR/$PROG" "$SELF_DIR/bin/$PROG-secret" "$BIN_DIR/"
-    for u in "${UNITS[@]}"; do install -m 644 "$SELF_DIR/systemd/$u" "$UNIT_DIR/"; done
-    install -m 644 "$SELF_DIR/README.md" "$DOC_DIR/"
+    for f in "$PROG" "bin/$PROG-secret"; do
+        # a link to the checkout stays one; install(1) makes new files, so a running sync is not disturbed
+        [[ $BIN_DIR/${f##*/} -ef $src/$f ]] || install -m 755 "$src/$f" "$BIN_DIR/"
+    done
+    for u in "${UNITS[@]}"; do install -m 644 "$src/systemd/$u" "$UNIT_DIR/"; done
+    install -m 644 "$src/README.md" "$DOC_DIR/"
+    printf '%s\n' "$src" > "$DOC_DIR/source"
     systemctl --user daemon-reload 2>/dev/null || true
     for a in $(cmd_accounts); do "$BIN_DIR/$PROG" regen "$a"; done
     install_link_handler
     info "installed to $BIN_DIR"
+    upstream_hint "$src"
     printf '\nNext:  %s\n       (shows the situation and what to do)\n' "$PROG"
 }
 cmd_uninstall() {

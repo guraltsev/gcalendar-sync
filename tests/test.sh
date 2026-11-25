@@ -88,6 +88,15 @@ refuse "missing calendar folder refused" "$GS" sync a
 mv "$T/away" "$L/secretary"
 check "fine again" "$GS" sync a
 
+# ---- read-only to two-way and back
+conf=$T/config/a/calendars.conf; before=$(ls "$P" | grep -c ics)
+sed -i 's/^main pull/main both/' "$conf"; check "regen to two-way" "$GS" regen a; check "sync" "$GS" sync a
+is "nothing lost or doubled in Google" "$(ls "$P" | grep -c ics)" "$before"
+ev "$L/main" fromhere x; check "sync" "$GS" sync a; check "now sent to Google" test -f "$P/fromhere.ics"
+sed -i 's/^main both/main pull/' "$conf"; rm "$P/fromhere.ics"; check "regen to read-only" "$GS" regen a; check "sync" "$GS" sync a; check "sync" "$GS" sync a
+refuse "a removal in Google is not undone" test -e "$P/fromhere.ics"; refuse "and arrives here" test -e "$L/main/fromhere.ics"
+is "Google as before" "$(ls "$P" | grep -c ics)" "$before"
+
 # ---- hooks, lock, move, remove, recover
 H=$T/config/a/hooks.d; mkdir -p "$H/post-sync" "$H/pre-sync" "$H/sync-failed"
 printf '#!/bin/sh\necho "$GCALENDAR_SYNC_ACCOUNT $GCALENDAR_SYNC_EVENT" > %s/hook\n' "$T" > "$H/post-sync/x"; chmod 700 "$H/post-sync/x"

@@ -498,7 +498,11 @@ generate_rc() {
     mv -f -- "$t" "$RC"
     [[ -d $CALENDARS ]] || { mkdir -p -- "$CALENDARS"; chmod "${DIR_MODE:-700}" -- "$CALENDARS"; }
     mkdir -p -- "$CALENDARS/.changes"
-    for n in "${NAMES[@]}"; do mkdir -p -- "$CALENDARS/$n"; done
+    for n in "${NAMES[@]}"; do
+        mkdir -p -- "$CALENDARS/$n"
+        # Changed between pull and both: the sync memory of the other way must not come back.
+        rm -f -- "$SD/vdirsyncer/$([[ ${CAL_MODE[$n]} == both ]] && echo pull || echo both)/$n".*
+    done
     apply_modes
     write_watch_dropin
 }
@@ -1122,14 +1126,17 @@ pick_calendars() {
         [[ $done_ids != *" $i "* ]] || continue
         sug=$(tr '[:upper:]' '[:lower:]' <<<"${names[k-1]%%@*}" | LC_ALL=C tr -cs 'a-z0-9\n' '-' | sed 's/^-*//; s/-*$//' | cut -c1-40)
         while :; do
-            prompt n "Folder name for \"${names[k-1]}\"" "${sug:-calendar$k}"
+            prompt n "Name of the folder here (nothing is renamed in Google) for \"${names[k-1]}\"" "${sug:-calendar$k}"
             if [[ ! $n =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then echo "  letters, digits, _ and - only"
             elif [[ -n ${CAL_ID[$n]:-} ]]; then echo "  '$n' is used already"
             elif [[ -n $(ls -A -- "$CALENDARS/$n" 2>/dev/null) ]]; then echo "  $CALENDARS/$n has files already"
             else break; fi
         done
         m=pull
-        if yes_no "  Should changes made here go to Google too? (n: read-only, safer)" n; then m=both; fi
+        echo "  n  read-only: Google's events come here; changes made here are undone and never reach Google"
+        echo "  y  two-way: events added, changed or deleted here are also added, changed or deleted in Google"
+        echo "     (can be changed later in calendars.conf, then gcalendar-sync regen)"
+        if yes_no "  Two-way?" n; then m=both; fi
         valid_calendar "$n" "$m" "$i"
         with_lock 120 do_add "$n" "$m" "$i"
         done_ids+="$i "
@@ -1144,19 +1151,31 @@ cmd_setup() {
     elif (( ${#accts[@]} == 1 )); then ACCT=${accts[0]}
     elif (( ${#accts[@]} > 1 )); then hint_accounts; bad_usage "which account? (a new name creates a new one)"
     else
-        echo "A short name of yours for this Google account (letters a-z, digits, _ -)."
+        echo "A short name of yours for this Google account (a-z, digits, _ -). It names the folder of the"
+        echo "calendars and the backup in $DEFAULT_ROOT, and you type it in commands if you have several accounts."
         while :; do prompt ACCT "Name" personal; [[ $ACCT =~ ^[a-z0-9][a-z0-9_-]{0,63}$ && $ACCT != help ]] && break; echo "  only a-z 0-9 _ -"; done
     fi
     if [[ ! -f $(acct_dir "$ACCT")/account.conf ]]; then
         printf '\n[1/6] Create the account\n'
         local em= modes=()
         while :; do prompt em "Google address"; valid_email "$em" && break; echo "  that is not an address"; done
-        echo "Will another account on this computer (an assistant, a family member) read these calendars?"
-        prompt share "  n: no, r: it only reads, w: it also adds events" n
+        cat <<'EOT'
+
+Will you share these calendars with another user account of this computer (for example an
+assistant's)? This only sets the permissions of the files here. It shares nothing by itself
+(you do that, with the folder's permissions or ACLs) and changes nothing in Google. Your
+backup, sign-in and settings stay private whatever you answer.
+  n  no        files 600, folders 700 as made by the sync: only you can read them
+  r  to read   files 640, folders 750: an account you share the folder with can read events
+  w  to write  files 660, folders 770: where you also share a calendar for writing, it can add
+               and change events; from a two-way calendar those changes go to Google
+To change it later: FILE_MODE and DIR_MODE in account.conf, then gcalendar-sync regen.
+EOT
+        prompt share "n, r or w" n
         case $share in [rR]*) modes=(--file-mode 640 --dir-mode 750) ;; [wW]*) modes=(--file-mode 660 --dir-mode 770) ;; esac
         local id=$ACCT
         if [[ -d $DEFAULT_ROOT/$id.backup.git ]]; then
-            echo "There is a backup of an earlier account with this name; it will be continued."
+            echo "There is a backup of an earlier account with this name; its history is kept and continued."
             cmd_recover "$id" --email "$em" "${modes[@]}"
         else cmd_init "$id" --email "$em" "${modes[@]}"; fi
     fi
@@ -1173,6 +1192,8 @@ cmd_setup() {
             *" add "*) printf '\n[4/6] Choose the calendars\n'; pick_calendars ;;
             *" sync "*) printf '\n[5/6] Sync\n'; ( cmd_sync "$ACCT" ) || { printf '\nThe sync did not work.\n'; load_account "$ACCT"; diagnose; show_next; return 1; } ;;
             *" enable-timers "*) printf '\n[6/6] Sync automatically\n'
+                echo "A systemd timer of yours syncs in the background, and at once when a file of a two-way calendar"
+                echo "changes; a weekly one checks the backup. To stop it: gcalendar-sync disable-timers"
                 if yes_no "Sync every 5 minutes from now on?"; then ( cmd_enable_timers "$ACCT" ) || return 1
                 else info "later: $NEXT"; return 0; fi ;;
         esac

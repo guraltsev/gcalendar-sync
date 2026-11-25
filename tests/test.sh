@@ -121,6 +121,50 @@ ln -s "$(command -v "${VDIRSYNCER:-vdirsyncer}")" "$T/fake/vdirsyncer"
 PATH=$T/fake:$PATH "$GS" install >/dev/null 2>&1; check "install: the program for the links" grep -q 'default gcalendar-sync-open.desktop x-scheme-handler/calendar-event' "$T/opened"
 check "its desktop file" grep -q "^Exec=\"$HOME/.local/bin/gcalendar-sync\" open %u" "$HOME/.local/share/applications/gcalendar-sync-open.desktop"
 
+# ---- install from anywhere, and --ff
+has() { [[ $out == *"$2"* ]] && ok "$1" || fail "$1: $out"; }
+inst() { PATH=$T/fake:$PATH "$@"; }
+IGC=$HOME/.local/bin/gcalendar-sync
+# The repository's own upstream is not asked: a checkout of its own, with a local upstream.
+gitq() { git -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@" >/dev/null 2>&1; }
+mkdir "$T/up"; cp -r "$here/../gcalendar-sync" "$here/../bin" "$here/../systemd" "$here/../README.md" "$T/up/"
+gitq -C "$T/up" init -b main; gitq -C "$T/up" add -A; gitq -C "$T/up" commit -m one
+gitq clone "$T/up" "$T/co"; CO=$T/co
+check "install from a checkout of its own" inst "$CO/gcalendar-sync" install
+newer() { echo "# $1" >> "$T/up/$2"; gitq -C "$T/up" commit -am "$1"; }
+inst_out() { out=$(cd / && inst "$@" 2>&1) && st=0 || st=$?; }
+inst_out "$IGC" install; is "the installed copy installs, from anywhere" "$st" 0
+has "... saying from where" "installing from $CO"
+case $out in *newer*) fail "nothing newer, nothing said: $out" ;; *) ok "nothing newer, nothing said" ;; esac
+inst_out "$IGC" install --ff; has "--ff with nothing new" "already up to date"
+newer two gcalendar-sync; inst_out "$IGC" install
+is "upstream newer: installs what is there" "$st:$(tail -n 1 "$IGC")" "0:$(tail -n 1 "$CO/gcalendar-sync")"
+has "... and says so" "1 newer commit(s), not installed"
+has "... and how to get it" "gcalendar-sync install --ff"
+refuse "... without pulling" grep -q '^# two' "$CO/gcalendar-sync"
+echo "# mine" >> "$CO/gcalendar-sync"; inst_out "$IGC" install
+has "uncommitted changes are pointed out" "uncommitted changes"
+inst_out "$IGC" install --ff; is "--ff: local changes in the way" "$st" 1
+has "... says what to do" "Commit, stash or undo"
+check "... and keeps them" grep -q '^# mine' "$CO/gcalendar-sync"
+gitq -C "$CO" checkout -- gcalendar-sync; echo "# mine" >> "$CO/README.md"
+inst_out "$IGC" install --ff; is "--ff: local changes elsewhere do not matter" "$st" 0
+check "--ff installs what it pulled" grep -q '^# two' "$IGC"
+check "... and keeps the local change" grep -q '^# mine' "$CO/README.md"
+gitq -C "$CO" commit -am mine; newer three gcalendar-sync; inst_out "$IGC" install --ff
+is "--ff: diverged" "$st" 1; has "... says so" "cannot fast-forward"
+inst_out "$IGC" install; is "diverged: plain install works" "$st" 0; has "... and says what to solve" "solve it there"
+mv "$T/up" "$T/up.away"; inst_out "$IGC" install; is "upstream unreachable: installs" "$st" 0; has "... and says so" "could not ask upstream"
+inst_out "$IGC" install --ff; is "upstream unreachable: --ff refuses" "$st" 1; mv "$T/up.away" "$T/up"
+refuse "install: unknown argument" inst "$IGC" install --nope
+ln -sf "$CO/gcalendar-sync" "$IGC"; inst_out "$IGC" install; is "a link to the checkout installs" "$st" 0
+check "... and stays a link" test -L "$IGC"; rm "$IGC"
+mkdir "$T/plain"; cp -r "$CO/gcalendar-sync" "$CO/bin" "$CO/systemd" "$CO/README.md" "$T/plain/"
+inst_out "$T/plain/gcalendar-sync" install; is "a checkout without git installs" "$st" 0
+inst_out "$IGC" install --ff; has "... but has nothing to pull" "is not a git repository"
+rm -rf "$T/plain"; inst_out "$IGC" install; is "source gone" "$st" 1; has "... says where it was" "$T/plain"
+rm "$HOME/.local/share/doc/gcalendar-sync/source"; inst_out "$IGC" install; has "source never recorded" "once in the source checkout"
+
 # ---- a calendar that becomes empty
 mkdir "$T/google/tiny@group"; ev "$T/google/tiny@group" only "Only one"
 check "add" "$GS" add a tiny tiny@group both; check "sync" "$GS" sync a

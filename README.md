@@ -56,6 +56,15 @@ After each commit, `.changes/YYYYMMDDTHHMMSS.mmmZ-COMMIT.tsv` appears at once (r
 kept 30 days. A reader remembers the last name it handled, and may watch the folder (`PathChanged=`). The file says only
 *that* something changed; read the event, or the backup for a deleted one. The first sync lists every event.
 
+## Links to events, for notes
+
+    [Committee meeting](calendar-event:UID?date=2027-01-11)
+
+`gcalendar-sync find committee` prints such links. The UID is the event's own, the same in every calendar program, so the link
+does not depend on Google; it stays right when the event is moved or renamed. The date is for the reader, and used only if
+the event is gone. `install` makes `gcalendar-sync open` the program for them: it shows the event and opens its day in Google
+Calendar. They work on computers where it is installed, not on the phone. A calendar with repeating events opens the first date.
+
 ## Sharing with another account
 
 `FILE_MODE`/`DIR_MODE` (e.g. 640/750; 660/770 for an account that writes) are applied after each sync, because vdirsyncer

@@ -534,23 +534,26 @@ vd() { "$VDIRSYNCER" -c "$1" "${@:2}"; }
 google_guide() {
     cat <<EOT
 Google lets a program read your calendar only if it is registered with Google. You register
-your own private "app" once (free, about 10 minutes); nobody else uses it. Use $EMAIL.
+your own private "app" once, in Google's Personal mode: free, only for you, no verification,
+no publishing. In the browser be signed in as $EMAIL: only the Google
+account that registers the app can use it.
 
- 1. Create a project:   https://console.cloud.google.com/projectcreate
-    Any name, e.g. calendar-sync. Press Create, and make sure it is the selected project.
- 2. Turn on the CalDAV API (not "Google Calendar API"):
+ 1. Register the app:   https://console.cloud.google.com/auth/overview/personal
+    Project:            a new project (Google suggests the name personal-mode-app)
+    Application type:   Desktop app
+    AI-powered agent:   leave it unticked
+    Accept the terms, press Continue.
+ 2. In the window "OAuth client created" press Download JSON. Google shows it only this once.
+ 3. Turn on the CalDAV API (not "Google Calendar API") in that project:
                         https://console.cloud.google.com/apis/library/caldav.googleapis.com
-    Press Enable.
- 3. Describe the app:   https://console.cloud.google.com/auth/overview
-    Get started. Any app name; your address as support e-mail and contact; audience: External.
- 4. Publish it:         https://console.cloud.google.com/auth/audience
-    Press Publish app, confirm. (Left in "Testing", you would have to sign in again every week.)
- 5. Create the client:  https://console.cloud.google.com/auth/clients
-    Create client, type: Desktop app, any name. In the window that appears press Download JSON.
-    (Close it without downloading and you may have to create another.)
+    Check at the top of the page that the project of step 1 is selected; press Enable.
 
 The downloaded file (client_secret_....json) holds the client's id and secret. It is stored
 encrypted here; afterwards delete the download.
+
+Already have an app of type External? It cannot be changed to Personal: register a new one as
+above. The old project can be deleted: https://console.cloud.google.com/iam-admin/settings
+(select the old project at the top, Shut down).
 EOT
 }
 # json_field FILE NAME — a text value of Google's file (flat, one level of nesting).
@@ -574,7 +577,7 @@ cmd_set_client() {
         json=${json#"${json%%[![:space:]]*}"}; json=${json%"${json##*[![:space:]]}"}
         json=${json#[\'\"]}; json=${json%[\'\"]}; json=${json#file://}; json=$(abspath "$json")
         [[ -f $json && -r $json ]] || die "there is no readable file $json"
-        grep -q '"installed"' -- "$json" || die "$json is not the file of a \"Desktop app\" client (step 5); create the client again with that type"
+        grep -q '"installed"' -- "$json" || die "$json is not the file of a \"Desktop app\" client (step 1); register the app again with that type"
         id=$(json_field "$json" client_id); secret=$(json_field "$json" client_secret)
         [[ -n $id && -n $secret ]] || die "no client id and secret in $json"
     fi
@@ -583,6 +586,10 @@ cmd_set_client() {
     f=$(acct_dir "$ACCT")/client.cred; t=$(mktemp "$f.XXXXXX")
     printf '%s\n%s' "$id" "$secret" | systemd-creds --user --name="gcalendar-sync-client-$ACCT" encrypt - "$t" \
         || { rm -f -- "$t"; die "systemd-creds encryption failed"; }
+    # A sign-in belongs to the client it was made with.
+    if [[ -f $f && $("$HELPER" "$ACCT" id 2>/dev/null || true) != "$id" && -f $(acct_dir "$ACCT")/token.cred ]]; then
+        rm -f -- "$(acct_dir "$ACCT")/token.cred"; info "this is another client: the old sign-in was removed"
+    fi
     chmod 600 -- "$t"; mv -f -- "$t" "$f"
     [[ $("$HELPER" "$ACCT" id) == "$id" ]] || die "the stored client could not be read back"
     info "client stored encrypted${json:+ (now delete $json)}"
@@ -619,11 +626,12 @@ do_authorize() {
     cat >&2 <<EOT
 Your browser opens Google's sign-in; use $EMAIL. (Or open the address below on THIS computer.)
 
-  "Google hasn't verified this app"   expected, the app is your own: Advanced, then Go to ...
-  "Access blocked: ... has not completed the Google verification process"
-                                      the app is still in Testing. Press Ctrl-C here, then
-                                      Publish app at https://console.cloud.google.com/auth/audience
-                                      (check the project at the top) and run this again.
+If Google refuses:
+  "Access blocked: ... has not completed the Google verification process", or a warning that
+  the app is not verified: it was not registered in Personal mode.
+  client_user_mismatch: this is not the Google account that registered the app.
+  Either way: Ctrl-C here, then  $PROG set-client $ACCT  shows how to register it.
+  Something about the CalDAV API: it is not enabled in the app's project (set-client, step 3).
 EOT
     discover_all || die "the sign-in or the listing failed"
     token_close; trap - EXIT
@@ -1007,7 +1015,7 @@ diagnose() {
         NEXT="$PROG authorize $ACCT"; NEXT_WHY="sign in to Google in the browser"; return
     elif [[ -e $SD/signin-expired ]]; then
         PROBLEMS+=("Google no longer accepts the sign-in, so nothing is synced")
-        NEXT="$PROG authorize $ACCT"; NEXT_WHY="sign in again (every week? then publish the app: $PROG help set-client)"; return
+        NEXT="$PROG authorize $ACCT"; NEXT_WHY="sign in again (every week? the app is not in Personal mode: $PROG set-client $ACCT)"; return
     elif [[ ${STEP_DONE[3]} == no ]]; then
         NEXT="$PROG add $ACCT"; NEXT_WHY="choose which calendars to keep here"; return
     fi

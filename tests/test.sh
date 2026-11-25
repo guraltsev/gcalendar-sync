@@ -129,6 +129,10 @@ check "set-client --json" "$GS" set-client a --json "$T/c s.json"
 is "id from the file" "$("$here/../bin/gcalendar-sync-secret" a id)" jid.apps
 is "secret from the file" "$("$here/../bin/gcalendar-sync-secret" a secret)" jsec-1
 check "path as dragged into a terminal" "$GS" set-client a --json "'$T/c s.json' "
+echo x > "$T/config/a/token.cred"; chmod 600 "$T/config/a/token.cred"
+check "same client again" "$GS" set-client a --json "$T/c s.json"; check "keeps the sign-in" test -e "$T/config/a/token.cred"
+sed 's/jid/other/' "$T/c s.json" > "$T/c2.json"; check "another client" "$GS" set-client a --json "$T/c2.json"
+refuse "removes the old sign-in" test -e "$T/config/a/token.cred"
 echo '{"web":{"client_id":"x","client_secret":"y"}}' > "$T/web.json"
 refuse "wrong client type refused" "$GS" set-client a --json "$T/web.json"
 refuse "missing file refused" "$GS" set-client a --json "$T/none.json"
@@ -140,7 +144,7 @@ try:
     while (x:=os.read(fd,4096)): b+=x
 except OSError: pass
 sys.stdout.write(b.decode())' "$GS" set-client a 2>&1) || true
-[[ $out == *"CalDAV API"*"Desktop app"*"nothing was stored"* ]] && ok "set-client explains itself" || fail "guide: $out"
+[[ $out == *"auth/overview/personal"*"Desktop app"*"CalDAV API"*"nothing was stored"* ]] && ok "set-client explains itself" || fail "guide: $out"
 
 # ==================================================== help and usage errors ===
 for c in $("$GS" help | sed -nE 's/^  ([a-z][a-z-]+) .*/\1/p' | sort -u); do

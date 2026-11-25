@@ -22,7 +22,7 @@ sudo dnf install vdirsyncer git
 gcalendar-sync setup
 ```
 
-`setup` guides you through everything: the account, Google's registration (explained step by step, with links), the
+`setup` guides you through everything: the account, Google's registration (a Personal mode app, explained step by step with links), the
 sign-in, choosing calendars, the first sync, the timers. Stop at any time; run it again to continue.
 
 Lost? `gcalendar-sync` alone (or `status`) shows which steps are done, what is wrong, and the command to run next.

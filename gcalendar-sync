@@ -125,11 +125,13 @@ Options [default]:
 EOH
         ;;
         set-client) cat <<'EOH'
-usage: gcalendar-sync set-client ACCOUNT [--stdin]
+usage: gcalendar-sync set-client ACCOUNT [--json FILE | --stdin]
 
-Store the Google OAuth client id and secret, encrypted. Asks for both;
-  --stdin   read them from standard input, one per line
-How to create them: README, "Google side, once".
+Give the program its Google registration (an "OAuth client"). Without options it
+explains, step by step, how to create one, and asks for the file Google lets you download.
+  --json FILE   that file (client_secret_....json)
+  --stdin       the id and the secret on two lines
+Both are stored encrypted.
 EOH
         ;;
         authorize) cat <<'EOH'
@@ -493,13 +495,52 @@ token_close() {
 }
 vd() { "$VDIRSYNCER" -c "$1" "${@:2}"; }
 
+google_guide() {
+    cat <<EOT
+Google lets a program read your calendar only if it is registered with Google. You register
+your own private "app" once (free, about 10 minutes); nobody else uses it. Use $EMAIL.
+
+ 1. Create a project:   https://console.cloud.google.com/projectcreate
+    Any name, e.g. calendar-sync. Press Create, and make sure it is the selected project.
+ 2. Turn on the CalDAV API (not "Google Calendar API"):
+                        https://console.cloud.google.com/apis/library/caldav.googleapis.com
+    Press Enable.
+ 3. Describe the app:   https://console.cloud.google.com/auth/overview
+    Get started. Any app name; your address as support e-mail and contact; audience: External.
+ 4. Publish it:         https://console.cloud.google.com/auth/audience
+    Press Publish app, confirm. (Left in "Testing", you would have to sign in again every week.)
+ 5. Create the client:  https://console.cloud.google.com/auth/clients
+    Create client, type: Desktop app, any name. In the window that appears press Download JSON.
+    (Close it without downloading and you may have to create another.)
+
+The downloaded file (client_secret_....json) holds the client's id and secret. It is stored
+encrypted here; afterwards delete the download.
+EOT
+}
+# json_field FILE NAME — a text value of Google's file (flat, one level of nesting).
+json_field() { tr -d '\n' < "$1" | sed -nE 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p'; }
 cmd_set_client() {
     load_account "${1:-}"; shift
-    local id secret t f
-    if [[ ${1:-} == --stdin ]]; then IFS= read -r id; IFS= read -r secret || [[ -n $secret ]]
-    else
-        [[ -r /dev/tty ]] || die "no terminal; use --stdin (id and secret on two lines)"
-        read -rp "OAuth client id: " id </dev/tty; read -rsp "OAuth client secret: " secret </dev/tty; echo >/dev/tty
+    local id= secret= t f json=
+    case ${1:-} in
+        --stdin) IFS= read -r id; IFS= read -r secret || [[ -n $secret ]] ;;
+        --json) need_value "$@"; json=$2 ;;
+        '')
+            [[ -t 0 ]] || bad_usage "no terminal; use --json FILE or --stdin"
+            google_guide
+            printf '\nPath of the downloaded file (or drag it here), Enter to stop: '
+            IFS= read -r json || true
+            [[ -n $json ]] || { info "nothing was stored; run this again when you have the file"; exit 1; } ;;
+        *) bad_usage "unknown option '$1'" ;;
+    esac
+    if [[ -n $json ]]; then
+        # what a terminal adds when a file is dragged in
+        json=${json#"${json%%[![:space:]]*}"}; json=${json%"${json##*[![:space:]]}"}
+        json=${json#[\'\"]}; json=${json%[\'\"]}; json=${json#file://}; json=$(abspath "$json")
+        [[ -f $json && -r $json ]] || die "there is no readable file $json"
+        grep -q '"installed"' -- "$json" || die "$json is not the file of a \"Desktop app\" client (step 5); create the client again with that type"
+        id=$(json_field "$json" client_id); secret=$(json_field "$json" client_secret)
+        [[ -n $id && -n $secret ]] || die "no client id and secret in $json"
     fi
     id=${id//[[:space:]]/} secret=${secret//[[:space:]]/}
     [[ -n $id && -n $secret ]] || die "empty id or secret"
@@ -508,7 +549,8 @@ cmd_set_client() {
         || { rm -f -- "$t"; die "systemd-creds encryption failed"; }
     chmod 600 -- "$t"; mv -f -- "$t" "$f"
     [[ $("$HELPER" "$ACCT" id) == "$id" ]] || die "the stored client could not be read back"
-    info "client stored encrypted; next: $PROG authorize $ACCT"
+    info "client stored encrypted${json:+ (now delete $json)}"
+    info "next: $PROG authorize $ACCT"
 }
 
 # discover_all — every calendar Google offers, as ID<TAB>NAME: vdirsyncer's discovery
@@ -538,6 +580,7 @@ cmd_authorize() {
 do_authorize() {
     [[ -n $TEST_REMOTE ]] || { ensure_private_dir "$RUN_ROOT"; ensure_private_dir "$RUN"; rm -f -- "$RUN/token.json" "$RUN/token.sum"; }
     trap token_close EXIT
+    info "your browser opens Google's sign-in. Google warns that it has not verified the app: it is yours; choose Advanced, then Go to ..."
     info "a browser opens for the Google sign-in of $EMAIL (or open the printed address on THIS computer)"
     discover_all || die "the sign-in or the listing failed"
     token_close; trap - EXIT
@@ -779,7 +822,7 @@ finish_setup() {
     ensure_private_dir "$CONF_ROOT"; ensure_private_dir "$(acct_dir "$ACCT")"
     write_account_conf; NAMES=(); load_account "$ACCT"; generate_rc; init_backup_repo
     info "calendars: $CALENDARS   backup: $BACKUP_GIT"
-    info "next: $PROG set-client $ACCT, then $PROG authorize $ACCT"
+    info "next: $PROG set-client $ACCT   (explains what Google needs, step by step)"
 }
 cmd_init() {
     need_account "${1:-}"; ACCT=$1; shift; setup_options "$@"

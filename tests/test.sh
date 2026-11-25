@@ -238,4 +238,30 @@ touch "$T/g/s/work/signin-expired"
 says "expired sign-in" "Next:  gcalendar-sync authorize work" "$GS" status
 check "no arguments: exit 0" "$GS"
 
+# ---- the sign-in: shows the address, Ctrl-C ends it, nothing is left behind
+export GCALENDAR_SYNC_CONFIG=$T/s/c GCALENDAR_SYNC_STATE=$T/s/s GCALENDAR_SYNC_CALENDARS=$T/s/cal BROWSER=true; unset GCALENDAR_SYNC_TEST_REMOTE
+"$GS" init a --email a@b.c >/dev/null; printf 'i.apps\ns\n' | "$GS" set-client a --stdin >/dev/null
+ctrl_c() { python3 -c '
+import os,pty,select,sys,time
+pid,fd=pty.fork()
+if pid==0: os.execvp(sys.argv[1],sys.argv[1:])
+t0=time.time(); out=b""; sent=False
+while time.time()-t0<20:
+    if select.select([fd],[],[],0.2)[0]:
+        try: x=os.read(fd,4096)
+        except OSError: break
+        if not x: break
+        out+=x
+    if b"Follow the" in out and not sent: time.sleep(1); os.write(fd,b"\x03"); sent=True
+else: os.kill(pid,9); out+=b"HUNG"
+print(out.decode(errors="replace"))' "$@"; }
+for c in "authorize a" "setup"; do
+    out=$(ctrl_c "$GS" $c); [[ $out == *"accounts.google.com"* && $out != *HUNG* ]] && ok "$c: Ctrl-C ends the sign-in" || fail "$c: $out"
+    refuse "$c: nothing left running" pgrep -f -- "-c $T/s/s/a/discover"
+done
+setsid "$GS" authorize a >/dev/null 2>&1 </dev/null & sleep 4
+out=$(ctrl_c "$GS" setup); [[ $out == *"accounts.google.com"* && $out != *HUNG* ]] && ok "a sign-in left waiting does not block the next" || fail "blocked: $out"
+refuse "nothing left running" pgrep -f -- "-c $T/s/s/a/discover"
+is "no token left in memory" "$(ls "$T/run/a" 2>/dev/null | wc -l)" 0
+
 (( fails == 0 )) && echo "all passed" || { echo "$fails failed"; exit 1; }

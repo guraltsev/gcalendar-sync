@@ -611,22 +611,28 @@ discover_all() {
       printf '\n[storage scratch]\ntype = "filesystem"\npath = "%s/cal"\nfileext = ".ics"\n' "$d"; } > "$d/conf"
     mkdir "$d/cal"
     # unbuffered, so that the address to sign in at is shown at once
-    PYTHONUNBUFFERED=1 vd "$d/conf" discover < <(yes y 2>/dev/null) 2>&1 | tee "$d/out" | sed -un '/^Opening \|^Follow/p' >&2 || rc=1
+    # In the background, because only then does Ctrl-C end it: vdirsyncer, waiting for the
+    # browser, ignores it (stop_discover ends it). Never with the lock: it could outlive us.
+    { PYTHONUNBUFFERED=1 vd "$d/conf" discover < <(yes y 2>/dev/null) 2>&1 | tee "$d/out" | sed -un '/^Opening \|^Follow/p' >&2; } {lockfd}>&- &
+    wait "$!" || rc=1
     if (( rc == 0 )); then
         sed -nE '/^scratch:/q; s/^  - "([^"]+)"( \("(.*)"\))?$/\1\t\3/p' "$d/out"
     else cat -- "$d/out" >&2; fi
     rm -rf -- "${d:?}"
     return "$rc"
 }
+# stop_discover — end a listing or sign-in of this account that is still waiting.
+stop_discover() { pkill -KILL -u "$(id -u)" -f -- " -c $SD/discover\." 2>/dev/null; }
 cmd_authorize() {
     load_account "${1:-}"
     [[ -n $TEST_REMOTE || -f $(acct_dir "$ACCT")/client.cred ]] || die "first: $PROG set-client $ACCT"
     ensure_private_dir "$SD"
+    ! stop_discover || info "an earlier sign-in was still waiting; it was stopped"
     with_lock 60 do_authorize
 }
 do_authorize() {
     [[ -n $TEST_REMOTE ]] || { ensure_private_dir "$RUN_ROOT"; ensure_private_dir "$RUN"; rm -f -- "$RUN/token.json" "$RUN/token.sum"; }
-    trap token_close EXIT
+    trap 'stop_discover; token_close' EXIT; trap 'echo >&2; warn "stopped; nothing was changed"; exit 130' INT; trap 'exit 143' TERM
     cat >&2 <<EOT
 Your browser opens Google's sign-in; use $EMAIL. (Or open the address below on THIS computer.)
 
@@ -638,13 +644,16 @@ If Google refuses:
   Something about the CalDAV API: it is not enabled in the app's project (set-client, step 3).
 EOT
     discover_all || die "the sign-in or the listing failed"
-    token_close; trap - EXIT
+    token_close; trap - EXIT INT TERM
     rm -f -- "$SD/signin-expired"
     [[ -n $TEST_REMOTE || -f $(acct_dir "$ACCT")/token.cred ]] || die "Google gave no lasting token; try again"
     info "signed in"; next_hint
 }
 cmd_list_calendars() { load_account "${1:-}"; ensure_private_dir "$SD"; with_lock 60 do_list; }
-do_list() { trap token_close EXIT; token_open; discover_all; token_close; trap - EXIT; }
+do_list() {
+    trap 'stop_discover; token_close' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+    token_open; discover_all; token_close; trap - EXIT INT TERM
+}
 
 cmd_add() {
     load_account "${1:-}"
@@ -776,7 +785,11 @@ with_lock() {
     local wait=$1; shift
     ensure_private_dir "$(state_dir "$ACCT")"
     exec {lockfd}>"$(state_dir "$ACCT")/lock"
-    flock -w "$wait" "$lockfd" || { warn "another run for '$ACCT' holds the lock; skipping"; exit 75; }
+    if ! flock -n "$lockfd" && (( wait > 0 )); then
+        info "waiting for another run of '$ACCT' to finish (at most $wait s)" >&2
+        flock -w "$wait" "$lockfd" || { warn "another run for '$ACCT' still holds the lock; see what runs: $PROG timers $ACCT"; exit 75; }
+    fi
+    flock -n "$lockfd" || { warn "another run for '$ACCT' holds the lock; skipping"; exit 75; }
     "$@"
     local rc=$?
     exec {lockfd}>&-       # setup takes the lock more than once
@@ -1188,7 +1201,7 @@ EOT
         last=$NEXT
         case $NEXT in
             *" set-client "*) printf '\n[2/6] Register with Google\n\n'; ( cmd_set_client "$ACCT" ) || return 1 ;;
-            *" authorize "*) printf '\n[3/6] Sign in\n'; ( cmd_authorize "$ACCT" >/dev/null ) || return 1 ;;
+            *" authorize "*) printf '\n[3/6] Sign in\n'; ( cmd_authorize "$ACCT" >/dev/null ) || { info "not signed in; try again with: $PROG setup"; return 1; } ;;
             *" add "*) printf '\n[4/6] Choose the calendars\n'; pick_calendars ;;
             *" sync "*) printf '\n[5/6] Sync\n'; ( cmd_sync "$ACCT" ) || { printf '\nThe sync did not work.\n'; load_account "$ACCT"; diagnose; show_next; return 1; } ;;
             *" enable-timers "*) printf '\n[6/6] Sync automatically\n'

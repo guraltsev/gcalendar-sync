@@ -124,6 +124,24 @@ printf 'cid.apps\nsecret-xyz\n' | "$GS" set-client a --stdin >/dev/null 2>"$T/ou
     refuse "no secret in the config" grep -q secret-xyz "$T/config/a/vdirsyncer.conf"
 } || { echo "skip secrets (systemd-creds --user does not work here)"; cat "$T/out"; }
 
+echo '{"installed":{"client_id":"jid.apps","project_id":"p","client_secret":"jsec-1","redirect_uris":["http://localhost"]}}' > "$T/c s.json"
+check "set-client --json" "$GS" set-client a --json "$T/c s.json"
+is "id from the file" "$("$here/../bin/gcalendar-sync-secret" a id)" jid.apps
+is "secret from the file" "$("$here/../bin/gcalendar-sync-secret" a secret)" jsec-1
+check "path as dragged into a terminal" "$GS" set-client a --json "'$T/c s.json' "
+echo '{"web":{"client_id":"x","client_secret":"y"}}' > "$T/web.json"
+refuse "wrong client type refused" "$GS" set-client a --json "$T/web.json"
+refuse "missing file refused" "$GS" set-client a --json "$T/none.json"
+out=$(python3 -c 'import os,pty,sys
+pid,fd=pty.fork()
+if pid==0: os.execv(sys.argv[1],sys.argv[1:])
+os.write(fd,b"\n"); b=b""
+try:
+    while (x:=os.read(fd,4096)): b+=x
+except OSError: pass
+sys.stdout.write(b.decode())' "$GS" set-client a 2>&1) || true
+[[ $out == *"CalDAV API"*"Desktop app"*"nothing was stored"* ]] && ok "set-client explains itself" || fail "guide: $out"
+
 # ==================================================== help and usage errors ===
 for c in $("$GS" help | sed -nE 's/^  ([a-z][a-z-]+) .*/\1/p' | sort -u); do
     out=$("$GS" "$c" --help 2>&1) && [[ $out == "usage: gcalendar-sync $c"* ]] && ok "$c --help" || fail "$c --help: $out"

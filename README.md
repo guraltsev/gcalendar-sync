@@ -16,10 +16,8 @@ Google Calendar in folders of `.ics` files, synced by [vdirsyncer](https://vdirs
 
 ## Google side, once
 
-1. <https://console.cloud.google.com>: create a project; enable the **CalDAV API** (not "Google Calendar API").
-2. OAuth consent screen: External. Publish it (*In production*): tokens of an app in *Testing* expire after 7 days.
-   Google warns that the app is not verified; it is your own.
-3. Credentials → Create OAuth client ID → **Desktop application**. Keep the id and the secret.
+`gcalendar-sync set-client ACCOUNT` explains the steps with links (project, CalDAV API, app, publish, *Desktop app* client)
+and asks for the file Google lets you download at the end.
 
 ## Install and first sync
 
@@ -27,7 +25,7 @@ Google Calendar in folders of `.ics` files, synced by [vdirsyncer](https://vdirs
 sudo dnf install vdirsyncer git
 ./gcalendar-sync install
 gcalendar-sync init personal --email you@gmail.com --file-mode 640 --dir-mode 750
-gcalendar-sync set-client personal          # id and secret
+gcalendar-sync set-client personal          # explains the Google steps
 gcalendar-sync authorize personal           # browser sign-in; prints the calendars
 gcalendar-sync add personal main you@gmail.com
 gcalendar-sync add personal secretary ID@group.calendar.google.com both

@@ -1,0 +1,10 @@
+[Unit]
+Description=Google Calendar sync: weekly backup maintenance for account %i
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

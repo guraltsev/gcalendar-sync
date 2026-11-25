@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Offline tests: never contact Google. A local folder stands in for it, so the real
+# pairs and the real vdirsyncer (VDIRSYNCER=...) are used. KEEP=1 keeps the temp folder.
+set -euo pipefail
+here=$(dirname -- "$(readlink -f -- "$0")")
+T=$(mktemp -d "${TMPDIR:-/tmp}/gcalendar-sync-test.XXXXXX")
+trap '[[ -n ${KEEP:-} ]] && echo "kept $T" || rm -rf -- "$T"' EXIT
+export HOME=$T/home XDG_CONFIG_HOME=$T/home/.config GCALENDAR_SYNC_CONFIG=$T/config GCALENDAR_SYNC_STATE=$T/state \
+       GCALENDAR_SYNC_CALENDARS=$T/cal GCALENDAR_SYNC_RUNTIME=$T/run GCALENDAR_SYNC_TEST_REMOTE=$T/google GCALENDAR_SYNC_SETTLE=0
+mkdir -p "$HOME"
+GS=$here/../gcalendar-sync
+fails=0
+ok()   { printf 'ok   %s\n' "$1"; }
+fail() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }
+check()  { local d=$1; shift; if "$@" >"$T/out" 2>&1; then ok "$d"; else fail "$d"; sed 's/^/     /' "$T/out"; fi; }
+refuse() { local d=$1; shift; if "$@" >/dev/null 2>&1; then fail "$d"; else ok "$d"; fi; }
+is()     { [[ $2 == "$3" ]] && ok "$1" || fail "$1 (got '$2', want '$3')"; }
+ev() { printf 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:t\r\nBEGIN:VEVENT\r\nUID:%s\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20261201T100000Z\r\nSUMMARY:%s\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n' "$2" "$3" > "$1/$2.ics"; }
+G=$T/google P=$T/google/me@x.com S=$T/google/sec@group.calendar.google.com L=$T/cal/a
+mkdir -p "$P" "$S"
+for i in 1 2 3 4 5 6; do ev "$P" "p$i" "Main $i"; ev "$S" "s$i" "Sec $i"; done
+echo -n 'My secretary' > "$S/displayname"
+
+check "init" "$GS" init a --email me@x.com --file-mode 640 --dir-mode 750
+refuse "init twice" "$GS" init a --email me@x.com
+refuse "bad account name" "$GS" init ../a --email me@x.com
+refuse "injection in email" "$GS" init b --email 'a"b@x'
+refuse "injection in path" "$GS" init b --email a@b.c --calendars $'/tmp/x\npath = "/"'
+refuse "backup inside calendars" "$GS" init b --email a@b.c --calendars "$T/b" --backup-git "$T/b/.git"
+refuse "sync without calendars" "$GS" sync a
+
+is "list-calendars" "$("$GS" list-calendars a 2>/dev/null | grep sec@)" $'sec@group.calendar.google.com\tMy secretary'
+refuse "bad calendar name" "$GS" add a '../x' me@x.com
+check "add pull (default)" "$GS" add a main me@x.com
+check "add both" "$GS" add a secretary sec@group.calendar.google.com both
+refuse "same calendar twice" "$GS" add a again me@x.com
+check "first sync" "$GS" sync a
+is "downloaded" "$(ls "$L/main" "$L/secretary" | grep -c ics)" 12
+is "file mode" "$(stat -c %a "$L/main/p1.ics")" 640
+is "dir mode" "$(stat -c %a "$L/main")" 750
+is "backup commit" "$("$GS" git a ls-tree -r --name-only main | grep -c 'main/p')" 6
+is "change notes not in the backup" "$("$GS" git a ls-tree -r --name-only main | grep -c changes || true)" 0
+is "change note: remote additions" "$(grep -hc $'^remote\tA\t' "$L"/.changes/*.tsv)" 12
+
+# ---- both ways
+ev "$L/secretary" mine "Local event"
+check "quick sync" "$GS" sync a --quick
+check "local event uploaded" test -f "$S/mine.ics"
+n=$(ls "$L/.changes" | wc -l)
+is "change note: local" "$(cat "$L"/.changes/*.tsv | grep -c $'^local\tA\tsecretary/mine.ics')" 1
+is "quick with nothing changed says nothing" "$("$GS" sync a --quick 2>&1)" ""
+is "and writes no note" "$(ls "$L/.changes" | wc -l)" "$n"
+sleep 0.1; ev "$P" p1 "Main 1 moved"; ev "$P" new1 "Invitation"; rm "$P/p2.ics"
+check "sync remote changes" "$GS" sync a
+check "update arrived" grep -q moved "$L/main/p1.ics"
+check "new arrived" test -f "$L/main/new1.ics"
+check "removal arrived" test ! -e "$L/main/p2.ics"
+is "notes" "$(cat "$(ls "$L"/.changes/*.tsv | tail -1)" | sort | tr '\t\n' '  ')" "remote A main/new1.ics remote D main/p2.ics remote M main/p1.ics "
+check "quiet sync" "$GS" sync a
+
+# ---- pull-only
+sleep 0.1; ev "$L/main" p3 "Local tampering"; ev "$L/main" intruder "x"; rm "$L/main/p4.ics"
+check "sync after tampering" "$GS" sync a
+check "and the one after" "$GS" sync a
+refuse "pull: local edit not sent" grep -q tampering "$P/p3.ics"
+refuse "pull: local event not sent" test -e "$P/intruder.ics"
+check "pull: local deletion not sent" test -f "$P/p4.ics"
+check "the local edit is in the history" bash -c "'$GS' git a log -p main -- main/p3.ics | grep -q tampering"
+is "pull: local side reverted" "$(grep -c tampering "$L/main/p3.ics" || true)-$([[ -e $L/main/p4.ics ]] && echo back)" "0-back"
+
+# ---- conflict: Google wins, the local version is in the backup
+sleep 0.1; ev "$L/secretary" s1 "LOCALVER"; ev "$S" s1 "REMOTEVER"
+check "conflict" "$GS" sync a
+check "Google's version stays" grep -q REMOTEVER "$L/secretary/s1.ics"
+check "local version in the backup" bash -c "'$GS' git a log -p main -- secretary/s1.ics | grep -q LOCALVER"
+
+# ---- guards
+rm "$L"/secretary/s[2-6].ics
+refuse "mass deletion refused" "$GS" sync a
+is "nothing deleted in Google" "$(ls "$S" | grep -c ics)" 7
+check "restore" "$GS" restore a "$T/restored" --rev main~1
+check "restored" test -f "$T/restored/secretary/s2.ics"
+refuse "restore into a full folder" "$GS" restore a "$T/restored"
+check "--force" "$GS" sync a --force
+is "deleted in Google" "$(ls "$S" | grep -c ics)" 2
+mv "$L/secretary" "$T/away"
+refuse "missing calendar folder refused" "$GS" sync a
+mv "$T/away" "$L/secretary"
+check "fine again" "$GS" sync a
+
+# ---- hooks, lock, move, remove, recover
+H=$T/config/a/hooks.d; mkdir -p "$H/post-sync" "$H/pre-sync" "$H/sync-failed"
+printf '#!/bin/sh\necho "$GCALENDAR_SYNC_ACCOUNT $GCALENDAR_SYNC_EVENT" > %s/hook\n' "$T" > "$H/post-sync/x"; chmod 700 "$H/post-sync/x"
+check "sync with a hook" "$GS" sync a; is "hook ran" "$(cat "$T/hook")" "a post-sync"
+chmod 770 "$H/post-sync/x"; rm "$T/hook"; "$GS" sync a >/dev/null 2>&1; refuse "writable hook refused" test -e "$T/hook"
+printf '#!/bin/sh\nexit 1\n' > "$H/pre-sync/no"; chmod 700 "$H/pre-sync/no"
+refuse "pre-sync cancels" "$GS" sync a; rm "$H/pre-sync/no"
+rc=0; flock "$T/state/a/lock" "$GS" sync a >/dev/null 2>&1 || rc=$?; is "locked" "$rc" 75
+check "maint" "$GS" maint a
+check "status" "$GS" status
+check "history" "$GS" history a 3
+check "move" "$GS" move a --calendars "$T/cal2"
+check "sync after move" "$GS" sync a; check "moved" test -f "$T/cal2/secretary/mine.ics"
+is "move changed nothing in Google" "$(ls "$P" | grep -c ics)" 6
+check "remove" "$GS" remove a secretary
+check "files stay" test -f "$T/cal2/secretary/mine.ics"
+check "Google stays" test -f "$S/mine.ics"
+mkdir -p "$T/gone"; mv "$T/config/a" "$T/gone/"; mv "$T/state/a" "$T/gone/state"
+refuse "init refuses the old backup" "$GS" init a --email me@x.com --calendars "$T/new"
+check "recover" "$GS" recover a --email me@x.com --calendars "$T/cal2"
+is "history kept" "$("$GS" git a rev-list --count main | awk '{print ($1>5)}')" 1
+
+# ---- secrets
+printf 'cid.apps\nsecret-xyz\n' | "$GS" set-client a --stdin >/dev/null 2>"$T/out" && {
+    is "client id" "$("$here/../bin/gcalendar-sync-secret" a id)" cid.apps
+    is "client secret" "$("$here/../bin/gcalendar-sync-secret" a secret)" secret-xyz
+    refuse "not in plain text" grep -rq secret-xyz "$T/config"
+    chmod 640 "$T/config/a/client.cred"; refuse "refuses a readable secret" "$here/../bin/gcalendar-sync-secret" a id
+    chmod 600 "$T/config/a/client.cred"
+    out=$(env -u GCALENDAR_SYNC_TEST_REMOTE "$GS" list-calendars a 2>&1 || true)
+    [[ $out == *"authorize"* ]] && ok "not signed in: says so" || fail "not signed in: $out"
+    env -u GCALENDAR_SYNC_TEST_REMOTE "$GS" add a main2 x@y.z >/dev/null 2>&1
+    check "real config names Google" grep -q 'type = "google_calendar"' "$T/config/a/vdirsyncer.conf"
+    refuse "no secret in the config" grep -q secret-xyz "$T/config/a/vdirsyncer.conf"
+} || { echo "skip secrets (systemd-creds --user does not work here)"; cat "$T/out"; }
+(( fails == 0 )) && echo "all passed" || { echo "$fails failed"; exit 1; }

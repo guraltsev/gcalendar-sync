@@ -1,0 +1,10 @@
+[Unit]
+Description=Google Calendar sync: every 5 minutes for account %i
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target

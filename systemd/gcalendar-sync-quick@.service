@@ -1,0 +1,13 @@
+[Unit]
+Description=Google Calendar quick sync of local changes for account %i
+Documentation=file://%h/.local/share/doc/gcalendar-sync/README.md
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/gcalendar-sync sync %i --quick
+# 75 = another run holds the lock; not a failure.
+SuccessExitStatus=75
+UMask=0077
+NoNewPrivileges=yes
+Nice=10
+TimeoutStartSec=15min

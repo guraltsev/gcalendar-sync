@@ -1,0 +1,9 @@
+# The folders to watch are in a drop-in written by gcalendar-sync (enable-timers, regen).
+[Unit]
+Description=Google Calendar sync: watch the two-way calendars of account %i
+
+[Path]
+Unit=gcalendar-sync-quick@%i.service
+
+[Install]
+WantedBy=paths.target

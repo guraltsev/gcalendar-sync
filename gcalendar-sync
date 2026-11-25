@@ -1,0 +1,694 @@
+#!/usr/bin/env bash
+# gcalendar-sync — Google Calendar <-> folders of .ics files with vdirsyncer, plus a
+# git-versioned backup of every state. The sibling of gmail-sync; see README.md.
+set -euo pipefail
+umask 077
+
+PROG=gcalendar-sync
+SELF_DIR=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")
+# In a checkout the helper is in bin/; installed, it is next to this program.
+HELPER=$SELF_DIR/gcalendar-sync-secret
+[[ ! -f $SELF_DIR/bin/gcalendar-sync-secret ]] || HELPER=$SELF_DIR/bin/gcalendar-sync-secret
+VDIRSYNCER=${VDIRSYNCER:-vdirsyncer}
+
+CONF_ROOT=${GCALENDAR_SYNC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/gcalendar-sync}
+STATE_ROOT=${GCALENDAR_SYNC_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/gcalendar-sync}
+DEFAULT_ROOT=${GCALENDAR_SYNC_CALENDARS:-$HOME/Documents/Calendars}
+RUN_ROOT=${GCALENDAR_SYNC_RUNTIME:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gcalendar-sync}
+UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+# Tests only: a folder that stands in for Google.
+TEST_REMOTE=${GCALENDAR_SYNC_TEST_REMOTE:-}
+
+die()  { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
+warn() { printf '%s: warning: %s\n' "$PROG" "$*" >&2; }
+info() { printf '%s: %s\n' "$PROG" "$*"; }
+
+usage() {
+    cat <<'EOT'
+usage: gcalendar-sync COMMAND [ACCOUNT] [ARGS]
+
+Program
+  install                 install or upgrade for this user; run it from a checkout
+  uninstall               turn the timers off and list the installed files to delete
+
+Setup
+  init ACCOUNT --email ADDR [--calendars DIR] [--backup-git DIR] [--backup-remote URL]
+               [--file-mode 640] [--dir-mode 750]
+                          create an account (refuses existing calendars or backups)
+  recover ACCOUNT --email ADDR [init's options]
+                          set an account up again on calendars and a backup still on disk
+  set-client ACCOUNT [--stdin]
+                          store the Google OAuth client id and secret, encrypted
+  authorize ACCOUNT       sign in to Google in the browser; the token is stored encrypted
+  list-calendars ACCOUNT  the calendars Google offers: id and name
+  add ACCOUNT NAME ID [both|pull]
+                          sync calendar ID in the folder NAME (default pull: read-only)
+  remove ACCOUNT NAME     stop syncing it (its files, backup and Google calendar stay)
+  regen ACCOUNT           apply edits made to account.conf or calendars.conf
+  move ACCOUNT [--calendars DIR] [--backup-git DIR]
+                          move the calendars and/or backup and update the settings
+  accounts                list the accounts
+
+Sync
+  sync ACCOUNT [--force]  back up, sync every calendar, back up again
+                          (--force overrides the mass-deletion guards)
+  sync ACCOUNT --quick    only two-way calendars with local changes; none: do nothing
+  status [ACCOUNT]
+
+Backup (git)
+  backup ACCOUNT          commit the current state now (and push)
+  history ACCOUNT [N]     the last N backup commits (default 20)
+  restore ACCOUNT DEST [--at DATE | --rev REV]
+                          export the calendars as they were into a new folder DEST
+  git ACCOUNT ARGS...     run any git command on the backup repository
+  maint ACCOUNT           git gc + fsck + push
+
+Scheduling (systemd --user)
+  enable-timers ACCOUNT   full sync every 5 minutes, quick sync when a file changes,
+                          maintenance weekly
+  disable-timers ACCOUNT
+  timers [ACCOUNT]
+  log ACCOUNT [JOURNALCTL-ARGS...]
+EOT
+}
+
+# ---------------------------------------------------------------- settings ---
+abspath() { case $1 in /*) printf '%s' "$1" ;; "~"/*) printf '%s/%s' "$HOME" "${1#\~/}" ;; *) printf '%s/%s' "$PWD" "$1" ;; esac; }
+acct_dir()  { printf '%s/%s' "$CONF_ROOT" "$1"; }
+state_dir() { printf '%s/%s' "$STATE_ROOT" "$1"; }
+ensure_private_dir() { mkdir -p -- "$1"; chmod 700 -- "$1"; }
+cmd_accounts() {
+    local d
+    for d in "$CONF_ROOT"/*/; do [[ ! -f $d/account.conf ]] || basename -- "$d"; done
+}
+need_account() {
+    if [[ -z ${1:-} || ! $1 =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
+        warn "give an account name (a-z 0-9 _ -); accounts: $(cmd_accounts | paste -sd' ' -)"
+        exit 1
+    fi
+}
+# A value that ends up in a generated config or unit must not break its syntax.
+safe_value() { [[ $2 != *[$'\n\r"\\%']* ]] || die "$1 must not contain newlines, double quotes, backslashes or %"; }
+valid_email() { [[ $1 =~ ^[^[:space:]@\"\\%]+@[^[:space:]@\"\\%]+$ ]]; }
+set_defaults() {
+    EMAIL= CALENDARS= BACKUP_GIT= BACKUP_REMOTE= SAFETY_MAX_DROP=10 FILE_MODE= DIR_MODE= HOOK_TIMEOUT=300 CHANGES_KEEP_DAYS=30
+}
+validate_settings() {
+    local where=$1 v
+    valid_email "$EMAIL" || die "$where: EMAIL is missing or not an address"
+    CALENDARS=${CALENDARS:-$DEFAULT_ROOT/$ACCT}; CALENDARS=${CALENDARS%/}
+    BACKUP_GIT=${BACKUP_GIT:-$DEFAULT_ROOT/$ACCT.backup.git}; BACKUP_GIT=${BACKUP_GIT%/}
+    [[ -z $FILE_MODE || $FILE_MODE =~ ^6[046][04]$ ]] || die "$where: FILE_MODE must be empty or like 600, 640, 660"
+    [[ -z $DIR_MODE || $DIR_MODE =~ ^7[057][05]$ ]] || die "$where: DIR_MODE must be empty or like 700, 750, 770"
+    for v in SAFETY_MAX_DROP HOOK_TIMEOUT CHANGES_KEEP_DAYS; do
+        [[ ${!v} =~ ^[0-9]{1,5}$ ]] || die "$where: $v must be a number"
+    done
+    (( SAFETY_MAX_DROP <= 100 )) || die "$where: SAFETY_MAX_DROP is a percentage 0-100"
+    for v in EMAIL CALENDARS BACKUP_GIT BACKUP_REMOTE; do safe_value "$v" "${!v}"; done
+    case $BACKUP_GIT/ in "$CALENDARS"/*) die "$where: BACKUP_GIT must be outside CALENDARS" ;; esac
+    case $CALENDARS/ in "$BACKUP_GIT"/*) die "$where: CALENDARS must be outside BACKUP_GIT" ;; esac
+}
+# account.conf is KEY=VALUE data, never executed.
+load_account() {
+    need_account "${1:-}"
+    ACCT=$1
+    local f line key val; f=$(acct_dir "$ACCT")/account.conf
+    [[ -f $f ]] || die "there is no account '$ACCT'; accounts: $(cmd_accounts | paste -sd' ' -)"
+    set_defaults
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ $line == *=* ]] || die "$f: malformed line: $line"
+        key=${line%%=*} val=${line#*=}
+        case $key in
+            EMAIL|CALENDARS|BACKUP_GIT|BACKUP_REMOTE|SAFETY_MAX_DROP|FILE_MODE|DIR_MODE|HOOK_TIMEOUT|CHANGES_KEEP_DAYS) printf -v "$key" '%s' "$val" ;;
+            *) die "$f: unknown key '$key'" ;;
+        esac
+    done < "$f"
+    validate_settings "$f"
+    RC=$(acct_dir "$ACCT")/vdirsyncer.conf SD=$(state_dir "$ACCT") RUN=$RUN_ROOT/$ACCT
+    load_calendars
+}
+# calendars.conf: NAME MODE ID, one per line.
+load_calendars() {
+    local f n m i; f=$(acct_dir "$ACCT")/calendars.conf
+    NAMES=(); declare -gA CAL_MODE=() CAL_ID=()
+    [[ -f $f ]] || return 0
+    while read -r n m i; do
+        [[ -n $n && $n != \#* ]] || continue
+        valid_calendar "$n" "$m" "$i"
+        [[ -z ${CAL_ID[$n]:-} ]] || die "$f: the name '$n' is used twice"
+        NAMES+=("$n"); CAL_MODE[$n]=$m; CAL_ID[$n]=$i
+    done < "$f"
+}
+valid_calendar() {
+    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || die "calendar name '$1': letters, digits, _ and - only"
+    [[ $2 =~ ^(both|pull)$ ]] || die "calendar $1: mode must be both or pull"
+    [[ $3 =~ ^[A-Za-z0-9._#@+-]+$ ]] || die "calendar $1: unexpected characters in the id '$3'"
+}
+write_calendars() {
+    local f n t; f=$(acct_dir "$ACCT")/calendars.conf
+    t=$(mktemp "$f.XXXXXX")
+    { echo "# NAME MODE ID   (both = two-way, pull = read-only). After editing: $PROG regen $ACCT"
+      for n in "${NAMES[@]}"; do printf '%s %s %s\n' "$n" "${CAL_MODE[$n]}" "${CAL_ID[$n]}"; done; } > "$t"
+    mv -f -- "$t" "$f"
+}
+write_account_conf() {
+    local f t; f=$(acct_dir "$ACCT")/account.conf
+    t=$(mktemp "$f.XXXXXX")
+    cat > "$t" <<EOT
+# gcalendar-sync account '$ACCT'. After editing run: $PROG regen $ACCT
+EMAIL=$EMAIL
+# One folder of .ics files per calendar
+CALENDARS=$CALENDARS
+# Git repository with the versioned backup, and an optional git URL it is pushed to
+BACKUP_GIT=$BACKUP_GIT
+BACKUP_REMOTE=$BACKUP_REMOTE
+# Refuse to sync if more than this % of a two-way calendar's local events vanished
+# since the last sync (and at least 3). 0 disables.
+SAFETY_MAX_DROP=$SAFETY_MAX_DROP
+# Permissions of events and folders, e.g. 640 and 750 (vdirsyncer writes 600, which
+# cancels the ACL of a share). Empty = leave them.
+FILE_MODE=$FILE_MODE
+DIR_MODE=$DIR_MODE
+# Seconds a hook (hooks.d/EVENT/*) may run
+HOOK_TIMEOUT=$HOOK_TIMEOUT
+# Days the change notes in CALENDARS/.changes are kept
+CHANGES_KEEP_DAYS=$CHANGES_KEEP_DAYS
+EOT
+    mv -f -- "$t" "$f"
+}
+
+# -------------------------------------------------------- vdirsyncer config ---
+remote_storage() { # NAME READ_ONLY
+    if [[ -n $TEST_REMOTE ]]; then
+        printf '[storage %s]\ntype = "filesystem"\npath = "%s"\nfileext = ".ics"\n' "$1" "$TEST_REMOTE"
+    else
+        printf '[storage %s]\ntype = "google_calendar"\ntoken_file = "%s/token.json"\n' "$1" "$RUN"
+        printf 'client_id.fetch = ["command", "%s", "%s", "id"]\n' "$HELPER" "$ACCT"
+        printf 'client_secret.fetch = ["command", "%s", "%s", "secret"]\n' "$HELPER" "$ACCT"
+    fi
+    [[ $2 != yes ]] || printf 'read_only = true\n'
+}
+pair() { # MODE — the pair of every calendar with this mode, if any
+    local n c=
+    for n in "${NAMES[@]}"; do
+        [[ ${CAL_MODE[$n]} == "$1" ]] || continue
+        c+="${c:+, }[\"$n\", \"${CAL_ID[$n]}\", \"$n\"]"
+    done
+    [[ -n $c ]] || return 0
+    printf '\n[pair %s]\na = "google_%s"\nb = "local_%s"\ncollections = [%s]\n' "$1" "$1" "$1" "$c"
+    # Changed on both sides: Google's version stays; the local one is in the pre-sync backup.
+    printf 'conflict_resolution = "a wins"\n'
+    # Local changes to a read-only calendar are undone (at the latest by the next sync).
+    [[ $1 == both ]] || printf 'partial_sync = "revert"\n'
+    echo
+    remote_storage "google_$1" "$([[ $1 == pull ]] && echo yes || echo no)"
+    printf '\n[storage local_%s]\ntype = "filesystem"\npath = "%s"\nfileext = ".ics"\n' "$1" "$CALENDARS"
+}
+generate_rc() {
+    local t n
+    [[ -x $HELPER ]] || die "helper not executable: $HELPER"
+    safe_value "helper path" "$HELPER"; safe_value "runtime folder" "$RUN"
+    ensure_private_dir "$SD"
+    t=$(mktemp "$RC.XXXXXX")
+    { printf '# Generated by %s for %s — DO NOT EDIT (account.conf, calendars.conf, then regen).\n' "$PROG" "$ACCT"
+      printf '[general]\nstatus_path = "%s/vdirsyncer"\n' "$SD"
+      pair both; pair pull; } > "$t"
+    cmp -s -- "$t" "$RC" 2>/dev/null || rm -f -- "$SD/discovered"
+    mv -f -- "$t" "$RC"
+    [[ -d $CALENDARS ]] || { mkdir -p -- "$CALENDARS"; chmod "${DIR_MODE:-700}" -- "$CALENDARS"; }
+    mkdir -p -- "$CALENDARS/.changes"
+    for n in "${NAMES[@]}"; do mkdir -p -- "$CALENDARS/$n"; done
+    apply_modes
+    write_watch_dropin
+}
+
+# ------------------------------------------------------------------ Google ---
+# The token is kept encrypted; vdirsyncer needs a file, which exists only while it
+# runs, in the runtime folder (memory, private to you).
+token_open() {
+    [[ -z $TEST_REMOTE ]] || return 0
+    ensure_private_dir "$RUN_ROOT"; ensure_private_dir "$RUN"
+    local c; c=$(acct_dir "$ACCT")/token.cred
+    rm -f -- "$RUN/token.json"
+    [[ -f $c ]] || { [[ ${1:-} == new ]] && return 0; die "not signed in; run: $PROG authorize $ACCT"; }
+    systemd-creds --user --name="gcalendar-sync-token-$ACCT" --newline=no decrypt "$c" "$RUN/token.json" \
+        || die "the stored token cannot be decrypted; run: $PROG authorize $ACCT"
+    chmod 600 -- "$RUN/token.json"
+    sha256sum < "$RUN/token.json" > "$RUN/token.sum"
+}
+token_close() {
+    [[ -z $TEST_REMOTE ]] || return 0
+    local f=$RUN/token.json t
+    if [[ -s $f ]] && grep -q '"refresh_token"' "$f" \
+       && [[ $(sha256sum < "$f") != "$(cat -- "$RUN/token.sum" 2>/dev/null)" ]]; then
+        t=$(mktemp "$(acct_dir "$ACCT")/.token.XXXXXX")
+        if systemd-creds --user --name="gcalendar-sync-token-$ACCT" encrypt - "$t" < "$f"; then
+            chmod 600 -- "$t"; mv -f -- "$t" "$(acct_dir "$ACCT")/token.cred"
+        else rm -f -- "$t"; warn "the renewed token could not be stored"; fi
+    fi
+    rm -f -- "$f" "$RUN/token.sum"
+}
+vd() { "$VDIRSYNCER" -c "$1" "${@:2}"; }
+
+cmd_set_client() {
+    load_account "${1:-}"; shift
+    local id secret t f
+    if [[ ${1:-} == --stdin ]]; then IFS= read -r id; IFS= read -r secret || [[ -n $secret ]]
+    else
+        [[ -r /dev/tty ]] || die "no terminal; use --stdin (id and secret on two lines)"
+        read -rp "OAuth client id: " id </dev/tty; read -rsp "OAuth client secret: " secret </dev/tty; echo >/dev/tty
+    fi
+    id=${id//[[:space:]]/} secret=${secret//[[:space:]]/}
+    [[ -n $id && -n $secret ]] || die "empty id or secret"
+    f=$(acct_dir "$ACCT")/client.cred; t=$(mktemp "$f.XXXXXX")
+    printf '%s\n%s' "$id" "$secret" | systemd-creds --user --name="gcalendar-sync-client-$ACCT" encrypt - "$t" \
+        || { rm -f -- "$t"; die "systemd-creds encryption failed"; }
+    chmod 600 -- "$t"; mv -f -- "$t" "$f"
+    [[ $("$HELPER" "$ACCT" id) == "$id" ]] || die "the stored client could not be read back"
+    info "client stored encrypted; next: $PROG authorize $ACCT"
+}
+
+# discover_all — every calendar Google offers, as ID<TAB>NAME: vdirsyncer's discovery
+# against a throw-away local side, whose missing folders it offers to create. (The
+# collections are Google's own, so nothing can be missing, or created, there.)
+discover_all() {
+    local d rc=0; d=$(mktemp -d "$SD/discover.XXXXXX")
+    { printf '[general]\nstatus_path = "%s/status"\n\n[pair all]\na = "remote"\nb = "scratch"\n' "$d"
+      printf 'collections = ["from a"]\n\n'
+      remote_storage remote yes
+      printf '\n[storage scratch]\ntype = "filesystem"\npath = "%s/cal"\nfileext = ".ics"\n' "$d"; } > "$d/conf"
+    mkdir "$d/cal"
+    # unbuffered, so that the address to sign in at is shown at once
+    PYTHONUNBUFFERED=1 vd "$d/conf" discover < <(yes y 2>/dev/null) 2>&1 | tee "$d/out" | sed -un '/^Opening \|^Follow/p' >&2 || rc=1
+    if (( rc == 0 )); then
+        sed -nE '/^scratch:/q; s/^  - "([^"]+)"( \("(.*)"\))?$/\1\t\3/p' "$d/out"
+    else cat -- "$d/out" >&2; fi
+    rm -rf -- "${d:?}"
+    return "$rc"
+}
+cmd_authorize() {
+    load_account "${1:-}"
+    [[ -n $TEST_REMOTE || -f $(acct_dir "$ACCT")/client.cred ]] || die "first: $PROG set-client $ACCT"
+    ensure_private_dir "$SD"
+    with_lock 60 do_authorize
+}
+do_authorize() {
+    [[ -n $TEST_REMOTE ]] || { ensure_private_dir "$RUN_ROOT"; ensure_private_dir "$RUN"; rm -f -- "$RUN/token.json" "$RUN/token.sum"; }
+    trap token_close EXIT
+    info "a browser opens for the Google sign-in of $EMAIL (or open the printed address on THIS computer)"
+    discover_all || die "the sign-in or the listing failed"
+    token_close; trap - EXIT
+    [[ -n $TEST_REMOTE || -f $(acct_dir "$ACCT")/token.cred ]] || die "Google gave no lasting token; try again"
+    info "signed in; next: $PROG add $ACCT NAME ID [both|pull]   (ids above)"
+}
+cmd_list_calendars() { load_account "${1:-}"; ensure_private_dir "$SD"; with_lock 60 do_list; }
+do_list() { trap token_close EXIT; token_open; discover_all; token_close; trap - EXIT; }
+
+cmd_add() {
+    load_account "${1:-}"
+    [[ $# -ge 3 ]] || die "add ACCOUNT NAME ID [both|pull]"
+    local n=$2 i=$3 m=${4:-pull} k
+    valid_calendar "$n" "$m" "$i"
+    [[ -z ${CAL_ID[$n]:-} ]] || die "there is already a calendar '$n'"
+    for k in "${NAMES[@]}"; do [[ ${CAL_ID[$k]} != "$i" ]] || die "that calendar is already synced, as '$k'"; done
+    [[ -z $(ls -A -- "$CALENDARS/$n" 2>/dev/null) ]] || die "$CALENDARS/$n already has content; move it aside first"
+    with_lock 120 do_add "$n" "$m" "$i"
+    info "$n: $m; next: $PROG sync $ACCT"
+}
+do_add() { NAMES+=("$1"); CAL_MODE[$1]=$2; CAL_ID[$1]=$3; write_calendars; generate_rc; }
+cmd_remove() {
+    load_account "${1:-}"
+    [[ -n ${2:-} && -n ${CAL_ID[$2]:-} ]] || die "remove: no calendar '${2:-}'"
+    with_lock 120 do_remove "$2"
+    info "$2 is no longer synced; its files stay in $CALENDARS/$2"
+}
+do_remove() {
+    local n keep=()
+    for n in "${NAMES[@]}"; do [[ $n == "$1" ]] || keep+=("$n"); done
+    NAMES=("${keep[@]}"); write_calendars; generate_rc
+    # Its sync memory must not outlive it: added again later, it starts fresh.
+    rm -f -- "$SD/vdirsyncer/both/$1".* "$SD/vdirsyncer/pull/$1".* "$SD/count-$1"
+}
+
+# -------------------------------------------------------------- git backup ---
+g() { git --git-dir="$BACKUP_GIT" --work-tree="$CALENDARS" "$@"; }
+repo_git() { git --git-dir="$BACKUP_GIT" --work-tree="$BACKUP_GIT" "$@"; }
+init_backup_repo() {
+    if [[ ! -d $BACKUP_GIT ]]; then
+        mkdir -p -- "$(dirname -- "$BACKUP_GIT")"
+        git init -q --bare "$BACKUP_GIT"; chmod 700 -- "$BACKUP_GIT"
+        repo_git symbolic-ref HEAD refs/heads/main
+    fi
+    local kv
+    for kv in "core.bare false" "core.worktree $CALENDARS" "user.name $PROG" "user.email $EMAIL" "commit.gpgSign false" \
+              "core.trustctime false" "core.fileMode false" "core.hooksPath /dev/null" "core.autocrlf false" \
+              "core.fsmonitor false" "core.quotePath false" "gc.autoDetach false"; do
+        repo_git config "${kv%% *}" "${kv#* }"
+    done
+    mkdir -p -- "$BACKUP_GIT/info"
+    printf '* -text\n' > "$BACKUP_GIT/info/attributes"
+    # change notes, vdirsyncer's unfinished writes, Syncthing
+    printf '%s\n' '.changes/' '*.tmp' '.st*' '*.sync-conflict-*' > "$BACKUP_GIT/info/exclude"
+    if [[ -n $BACKUP_REMOTE ]]; then
+        repo_git remote set-url backup "$BACKUP_REMOTE" 2>/dev/null || repo_git remote add backup "$BACKUP_REMOTE"
+    else repo_git remote remove backup 2>/dev/null || true; fi
+}
+push_backup() {
+    [[ -n $BACKUP_REMOTE ]] || return 0
+    timeout 120 git --git-dir="$BACKUP_GIT" push -q backup main 2>&1 || warn "push to $BACKUP_REMOTE failed; will retry"
+}
+# backup_commit LABEL ORIGIN — commit what changed; ORIGIN (local|remote) goes in the change notes.
+backup_commit() {
+    local label=$1 origin=$2 stats
+    [[ -d $BACKUP_GIT ]] || init_backup_repo
+    g add -A .
+    ! g diff --cached --quiet || return 0
+    stats=$(g diff --cached --no-renames --name-status | cut -c1 | sort | uniq -c | awk '
+        BEGIN { n["A"]="added"; n["D"]="removed"; n["M"]="changed" }
+        { printf "%s%d %s", (NR>1 ? ", " : ""), $1, ($2 in n ? n[$2] : $2) }')
+    g commit -q -m "$label $(date -Is): $stats"
+    info "backup: $label ($stats)"
+    write_changes "$origin"
+    push_backup
+}
+
+# ------------------------------------------------------------ change notes ---
+# .changes/TIME-COMMIT.tsv, one per commit: ORIGIN <TAB> A|M|D <TAB> NAME/FILE.ics.
+# This is how other programs (and accounts the folder is shared with) learn what
+# changed: watch the folder, read the files after the last one you handled.
+write_changes() {
+    local d=$CALENDARS/.changes name st path t
+    mkdir -p -- "$d"
+    name=$(date -u +%Y%m%dT%H%M%S.%3N)Z-$(g rev-parse --short=10 HEAD).tsv
+    t=$d/.$name.part
+    while IFS= read -r -d '' st && IFS= read -r -d '' path; do
+        [[ $path == */*.ics && $path != *[$'\t\n']* ]] || continue
+        printf '%s\t%s\t%s\n' "$1" "$st" "$path"
+    done < <(g diff-tree --root -r --no-commit-id --no-renames --name-status -z HEAD) > "$t"
+    if [[ -s $t ]]; then
+        [[ -z $FILE_MODE ]] || chmod "$FILE_MODE" -- "$t"
+        mv -f -- "$t" "$d/$name"
+    else rm -f -- "$t"; fi
+    find "$d" -maxdepth 1 -type f -name '*.tsv' -mtime "+$CHANGES_KEEP_DAYS" -delete 2>/dev/null || true
+}
+
+# ----------------------------------------------------- permissions, hooks ---
+# Only our own files: another account's (a shared calendar) keep theirs.
+apply_modes() {
+    [[ -d $CALENDARS ]] || return 0
+    [[ -z $DIR_MODE ]]  || find "$CALENDARS" -type d -user "$(id -u)" ! -perm "$DIR_MODE" ! -perm "2$DIR_MODE" -exec chmod "$DIR_MODE" -- {} + 2>/dev/null || true
+    [[ -z $FILE_MODE ]] || find "$CALENDARS" -type f -user "$(id -u)" ! -perm "$FILE_MODE" -exec chmod "$FILE_MODE" -- {} + 2>/dev/null || true
+}
+hook_safe() {
+    local m
+    [[ ! -L $1 && -O $1 ]] || return 1
+    m=$(stat -c %a -- "$1") || return 1
+    (( (8#$m & 8#022) == 0 ))
+}
+# hooks.d/pre-sync (a failure cancels the sync), post-sync, sync-failed
+run_hooks() {
+    local event=$1 status=$2 base d h rc bad=0
+    base=$(acct_dir "$ACCT")/hooks.d; d=$base/$event
+    [[ -d $d ]] || return 0
+    for h in "$base" "$d"; do
+        hook_safe "$h" || { warn "hooks not run: $h must be a folder of yours (no link) that group and others cannot write to"; return 1; }
+    done
+    for h in "$d"/*; do
+        case $h in *~|*.bak|*.rpmnew|*.rpmsave|*.disabled) continue ;; esac
+        [[ -f $h && -x $h ]] || continue
+        hook_safe "$h" || { warn "hook refused: $h must be your own file that group and others cannot write to"; bad=1; continue; }
+        rc=0
+        GCALENDAR_SYNC_ACCOUNT=$ACCT GCALENDAR_SYNC_CALENDARS=$CALENDARS GCALENDAR_SYNC_EVENT=$event GCALENDAR_SYNC_STATUS=$status \
+            timeout -k 10 "$HOOK_TIMEOUT" "$h" </dev/null {lockfd}>&- || rc=$?
+        if (( rc != 0 )); then
+            warn "hook $event/${h##*/} failed (status $rc)"; bad=1
+            [[ $event != pre-sync ]] || return 1
+        fi
+    done
+    return "$bad"
+}
+
+# -------------------------------------------------------------------- sync ---
+with_lock() {
+    local wait=$1; shift
+    ensure_private_dir "$(state_dir "$ACCT")"
+    exec {lockfd}>"$(state_dir "$ACCT")/lock"
+    flock -w "$wait" "$lockfd" || { warn "another run for '$ACCT' holds the lock; skipping"; exit 75; }
+    "$@"
+}
+count_events() { find "$1" -maxdepth 1 -type f -name '*.ics' 2>/dev/null | wc -l; }
+safety_check() { # NAMES...
+    (( SAFETY_MAX_DROP > 0 )) || return 0
+    local n last now bad=0
+    for n in "$@"; do
+        [[ ${CAL_MODE[$n]} == both ]] || continue
+        last=$(cat -- "$SD/count-$n" 2>/dev/null || echo 0); now=$(count_events "$CALENDARS/$n")
+        if (( now < last && (last - now) * 100 > last * SAFETY_MAX_DROP && last - now >= 3 )); then
+            warn "$n shrank from $last to $now events since the last sync; refusing to delete them in Google."
+            warn "intended: $PROG sync $ACCT --force   to get them back: $PROG restore $ACCT /some/new/dir"
+            bad=1
+        fi
+    done
+    return "$bad"
+}
+ENDED=no
+sync_ended() {
+    local rc=$?
+    trap - EXIT INT TERM
+    token_close
+    if [[ $ENDED == no && $rc != 0 ]]; then
+        date -Is > "$SD/last-failure"
+        apply_modes; run_hooks sync-failed "$rc" || true
+    fi
+    exit "$rc"
+}
+do_sync() {
+    local force=$1 quick=$2 n rc=0 todo=() targets=() t0=$SECONDS
+    if [[ $quick == yes ]]; then
+        # Files a sync itself wrote are committed already, so they do not count here.
+        [[ -d $BACKUP_GIT ]] || return 0
+        for n in "${NAMES[@]}"; do
+            [[ ${CAL_MODE[$n]} == both && -n $(g status --porcelain --untracked-files=all -- "$n") ]] || continue
+            todo+=("$n"); targets+=("both/$n")
+        done
+        (( ${#todo[@]} )) || return 0
+    else
+        todo=("${NAMES[@]}")
+        for n in "${NAMES[@]}"; do targets+=("${CAL_MODE[$n]}/$n"); done
+    fi
+    (( ${#todo[@]} )) || die "no calendars yet; see: $PROG list-calendars $ACCT, $PROG add $ACCT ..."
+    trap sync_ended EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+    run_hooks pre-sync 0 || { warn "cancelled by a pre-sync hook"; return 5; }
+    for n in "${todo[@]}"; do [[ -d $CALENDARS/$n ]] || { [[ ! -s $SD/count-$n ]] || die "$CALENDARS/$n is missing (disk not mounted?)"; mkdir -p -- "$CALENDARS/$n"; }; done
+    backup_commit pre-sync local
+    [[ $force == yes ]] || safety_check "${todo[@]}" || return 4
+    token_open
+    local args=()
+    [[ $force != yes ]] || args=(--force-delete)
+    if [[ ! -e $SD/discovered ]]; then
+        # Never creates a calendar: every question is answered no.
+        vd "$RC" discover < <(yes n 2>/dev/null) || die "vdirsyncer could not find all the calendars (renamed or removed in Google?)"
+        touch -- "$SD/discovered"
+    fi
+    vd "$RC" sync "${args[@]}" "${targets[@]}" </dev/null || rc=$?
+    token_close
+    apply_modes
+    backup_commit sync remote
+    if (( rc == 0 )); then
+        for n in "${todo[@]}"; do count_events "$CALENDARS/$n" > "$SD/count-$n"; done
+        date -Is > "$SD/last-sync$([[ $quick == yes ]] && echo -quick || true)"
+        ENDED=yes
+        run_hooks post-sync 0 || true
+        info "synced ${#todo[@]} calendars in $((SECONDS - t0))s"
+    else warn "vdirsyncer exited with status $rc"; fi
+    return "$rc"
+}
+cmd_sync() {
+    load_account "${1:-}"; shift
+    local force=no quick=no
+    while (( $# )); do case $1 in --force) force=yes ;; --quick) quick=yes ;; *) die "sync: unknown argument '$1'" ;; esac; shift; done
+    [[ -f $RC ]] || generate_rc
+    if [[ $quick == yes ]]; then sleep "${GCALENDAR_SYNC_SETTLE:-2}"; with_lock 300 do_sync "$force" yes
+    else with_lock 0 do_sync "$force" no; fi
+}
+
+# ------------------------------------------------------------------- setup ---
+setup_options() {
+    set_defaults
+    while (( $# )); do
+        case $1 in
+            --email) EMAIL=${2:?} ;;
+            --calendars) CALENDARS=$(abspath "${2:?}") ;;
+            --backup-git) BACKUP_GIT=$(abspath "${2:?}") ;;
+            --backup-remote) BACKUP_REMOTE=${2:?} ;;
+            --file-mode) FILE_MODE=${2?} ;;
+            --dir-mode) DIR_MODE=${2?} ;;
+            *) die "$CMD: unknown option $1" ;;
+        esac
+        shift 2
+    done
+    validate_settings "$CMD"
+    [[ ! -e $(acct_dir "$ACCT")/account.conf ]] || die "account '$ACCT' already exists"
+}
+finish_setup() {
+    ensure_private_dir "$CONF_ROOT"; ensure_private_dir "$(acct_dir "$ACCT")"
+    write_account_conf; NAMES=(); load_account "$ACCT"; generate_rc; init_backup_repo
+    info "calendars: $CALENDARS   backup: $BACKUP_GIT"
+    info "next: $PROG set-client $ACCT, then $PROG authorize $ACCT"
+}
+cmd_init() {
+    need_account "${1:-}"; ACCT=$1; shift; setup_options "$@"
+    [[ ! -e $BACKUP_GIT ]] || die "init: $BACKUP_GIT already exists; use: $PROG recover $ACCT"
+    [[ -z $(ls -A -- "$CALENDARS" 2>/dev/null) ]] || die "init: $CALENDARS already has content; use recover, or another --calendars"
+    finish_setup
+}
+cmd_recover() {
+    need_account "${1:-}"; ACCT=$1; shift; setup_options "$@"
+    repo_git rev-parse -q --verify 'main^{commit}' >/dev/null 2>&1 || die "recover: no backup with history at $BACKUP_GIT (--backup-git DIR)"
+    info "backup: $(repo_git rev-list --count main) commits, last: $(repo_git log -1 --format=%s main)"
+    # vdirsyncer's memory of the last sync is not in the backup. Events that are already
+    # there on both sides are matched by their UID; others would be uploaded.
+    [[ -d $(state_dir "$ACCT")/vdirsyncer ]] || info "no sync state: the next sync compares by event UID; a local event deleted in Google meanwhile would be uploaded again to a two-way calendar"
+    finish_setup
+    info "then add each calendar again; move its folder aside first (it is downloaded again, the history is kept)"
+}
+cmd_regen() { load_account "${1:-}"; with_lock 120 generate_rc; init_backup_repo; info "regenerated $RC"; }
+cmd_move() {
+    load_account "${1:-}"; shift
+    local nc=$CALENDARS nb=$BACKUP_GIT
+    while (( $# )); do case $1 in
+        --calendars) nc=$(abspath "${2:?}") ;; --backup-git) nb=$(abspath "${2:?}") ;; *) die "move: unknown option $1" ;;
+    esac; shift 2; done
+    with_lock 600 do_move "${nc%/}" "${nb%/}"
+}
+do_move() {
+    local oc=$CALENDARS ob=$BACKUP_GIT i old new
+    CALENDARS=$1 BACKUP_GIT=$2; validate_settings move
+    for i in "$oc|$1" "$ob|$2"; do
+        old=${i%%|*} new=${i#*|}
+        [[ $old == "$new" ]] && continue
+        [[ ! -e $new || ! -e $old ]] || die "move: $new already exists"
+        [[ -e $new || -e $old ]] || die "move: neither $old nor $new exists"
+        case $new/ in "$old"/*) die "move: $new is inside $old" ;; esac
+    done
+    for i in "$oc|$1" "$ob|$2"; do
+        old=${i%%|*} new=${i#*|}
+        if [[ $old != "$new" && -e $old ]]; then mkdir -p -- "$(dirname -- "$new")"; mv -T -- "$old" "$new"; fi
+    done
+    write_account_conf; generate_rc; init_backup_repo
+    info "account '$ACCT' now uses $CALENDARS and $BACKUP_GIT"
+}
+
+# ------------------------------------------------------------------ backup ---
+cmd_backup() { load_account "${1:-}"; with_lock 600 backup_commit manual local; }
+cmd_history() { load_account "${1:-}"; [[ ${2:-20} =~ ^[0-9]+$ ]] || die "history: N must be a number"; g log -n "${2:-20}" --format='%h  %s'; }
+cmd_git() { load_account "${1:-}"; shift; g "$@"; }
+cmd_restore() {
+    load_account "${1:-}"; shift
+    local dest= rev=main
+    while (( $# )); do case $1 in
+        --at) rev=$(g rev-list -1 --before="${2:?}" main); [[ -n $rev ]] || die "no backup from before '$2'"; shift ;;
+        --rev) rev=${2:?}; shift ;;
+        -*) die "restore: unknown option $1" ;;
+        *) dest=$(abspath "$1") ;;
+    esac; shift; done
+    [[ -n $dest ]] || die "restore: DEST directory required"
+    case $dest/ in "$CALENDARS"/*) die "DEST must be outside the live calendars" ;; esac
+    [[ -z $(ls -A -- "$dest" 2>/dev/null) ]] || die "$dest is not empty"
+    g rev-parse --verify -q "$rev^{commit}" >/dev/null || die "unknown revision '$rev'"
+    ensure_private_dir "$dest"
+    g archive --format=tar "$rev" | tar -x -C "$dest"
+    info "restored $(g log -1 --date=iso --format='%h from %ad' "$rev") into $dest"
+    info "to bring an event back, copy its .ics into the calendar's folder in $CALENDARS"
+}
+do_maint() { g gc --quiet; g fsck --no-progress --no-dangling; push_backup; info "maintenance done"; }
+cmd_maint() { load_account "${1:-}"; with_lock 600 do_maint; }
+
+# -------------------------------------------------------------- scheduling ---
+write_watch_dropin() {
+    local d=$UNIT_DIR/$PROG-watch@$ACCT.path.d n
+    [[ -d $d || ${1:-} == create ]] || return 0
+    mkdir -p -- "$d"
+    { echo "# Generated by $PROG"; echo "[Path]"
+      for n in "${NAMES[@]}"; do [[ ${CAL_MODE[$n]} != both ]] || printf 'PathChanged=%s/%s\n' "$CALENDARS" "$n"; done; } > "$d/calendars.conf"
+    systemctl --user daemon-reload 2>/dev/null || true
+    # A path unit without any path does not load; it takes up changed paths only when restarted.
+    if systemctl --user is-active -q "$PROG-watch@$ACCT.path" 2>/dev/null; then
+        if grep -q '^PathChanged=' "$d/calendars.conf"; then systemctl --user restart "$PROG-watch@$ACCT.path" || warn "could not restart the watch"
+        else systemctl --user stop "$PROG-watch@$ACCT.path" || true; fi
+    fi
+}
+cmd_enable_timers() {
+    load_account "${1:-}"
+    write_watch_dropin create
+    systemctl --user enable --now "$PROG@$ACCT.timer" "$PROG-maint@$ACCT.timer"
+    if grep -q '^PathChanged=' "$UNIT_DIR/$PROG-watch@$ACCT.path.d/calendars.conf"; then
+        systemctl --user enable --now "$PROG-watch@$ACCT.path"
+    else info "no two-way calendar yet: nothing to watch (run enable-timers again after adding one)"; fi
+    [[ $(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null) == yes ]] \
+        || warn "lingering is off: timers only run while you are logged in (loginctl enable-linger)"
+}
+cmd_disable_timers() { load_account "${1:-}"; systemctl --user disable --now "$PROG@$ACCT.timer" "$PROG-maint@$ACCT.timer" "$PROG-watch@$ACCT.path" 2>/dev/null || true; }
+cmd_timers() {
+    local a accts=() u
+    if [[ -n ${1:-} ]]; then load_account "$1"; accts=("$1"); else mapfile -t accts < <(cmd_accounts); fi
+    for a in "${accts[@]}"; do
+        for u in "$PROG@$a.timer" "$PROG-maint@$a.timer" "$PROG-watch@$a.path"; do
+            printf '%-40s %s, %s\n' "$u" "$(systemctl --user is-enabled "$u" 2>/dev/null || true)" "$(systemctl --user is-active "$u" 2>/dev/null || true)"
+        done
+        systemctl --user --no-pager list-timers --all "$PROG@$a.timer" "$PROG-maint@$a.timer" 2>/dev/null | sed '/^$/,$d' || true
+    done
+}
+cmd_log() {
+    load_account "${1:-}"; shift
+    (( $# )) || set -- -e
+    exec journalctl --user -u "$PROG@$ACCT.service" -u "$PROG-quick@$ACCT.service" -u "$PROG-maint@$ACCT.service" "$@"
+}
+cmd_status() {
+    local a n k accts=()
+    if [[ -n ${1:-} ]]; then need_account "$1"; accts=("$1"); else mapfile -t accts < <(cmd_accounts); fi
+    (( ${#accts[@]} )) || { info "no accounts yet: $PROG init NAME --email you@gmail.com"; return 0; }
+    for a in "${accts[@]}"; do
+        load_account "$a"
+        printf '%s <%s>\n' "$a" "$EMAIL"
+        for n in "${NAMES[@]}"; do printf '  %-20s %s, %s events\n' "$n" "${CAL_MODE[$n]}" "$(count_events "$CALENDARS/$n")"; done
+        printf '  calendars      %s\n  backup         %s (%s commits)\n' "$CALENDARS" "$BACKUP_GIT" "$(g rev-list --count main 2>/dev/null || echo 0)"
+        for k in last-sync last-sync-quick last-failure; do printf '  %-14s %s\n' "${k//-/ }" "$(cat -- "$SD/$k" 2>/dev/null || echo never)"; done
+        printf '  signed in      %s\n' "$([[ -f $(acct_dir "$a")/token.cred ]] && echo yes || echo no)"
+    done
+}
+
+# ----------------------------------------------------------------- install ---
+UNITS=("$PROG@.service" "$PROG@.timer" "$PROG-quick@.service" "$PROG-watch@.path" "$PROG-maint@.service" "$PROG-maint@.timer")
+install_dirs() { BIN_DIR=$HOME/.local/bin; DOC_DIR=$HOME/.local/share/doc/$PROG; }
+cmd_install() {
+    install_dirs
+    local u dep a
+    [[ -f $SELF_DIR/README.md && -f $SELF_DIR/systemd/${UNITS[0]} ]] || die "install: run ./$PROG install in a source checkout"
+    for dep in vdirsyncer systemd-creds flock git tar; do
+        command -v "$dep" >/dev/null || die "missing dependency: $dep (sudo dnf install vdirsyncer git)"
+    done
+    install -d -m 755 "$BIN_DIR" "$UNIT_DIR" "$DOC_DIR"
+    install -m 755 "$SELF_DIR/$PROG" "$SELF_DIR/bin/$PROG-secret" "$BIN_DIR/"
+    for u in "${UNITS[@]}"; do install -m 644 "$SELF_DIR/systemd/$u" "$UNIT_DIR/"; done
+    install -m 644 "$SELF_DIR/README.md" "$DOC_DIR/"
+    systemctl --user daemon-reload 2>/dev/null || true
+    for a in $(cmd_accounts); do "$BIN_DIR/$PROG" regen "$a"; done
+    info "installed to $BIN_DIR"
+}
+cmd_uninstall() {
+    install_dirs
+    local a
+    for a in $(cmd_accounts); do cmd_disable_timers "$a"; done
+    info "timers are off; now delete these (settings, calendars and backups are not among them):"
+    printf '  %s\n' "$BIN_DIR/$PROG" "$BIN_DIR/$PROG-secret" "${UNITS[@]/#/$UNIT_DIR/}" "$UNIT_DIR/$PROG-watch@*.path.d/" "$DOC_DIR/"
+}
+
+CMD=${1:-help}; shift || true
+case $CMD in
+    init|recover|regen|move|accounts|add|remove|authorize|sync|backup|history|restore|git|maint|status|timers|log|install|uninstall) "cmd_$CMD" "$@" ;;
+    set-client|list-calendars|enable-timers|disable-timers) "cmd_${CMD//-/_}" "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; exit 2 ;;
+esac

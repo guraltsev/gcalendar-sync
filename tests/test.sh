@@ -123,4 +123,32 @@ printf 'cid.apps\nsecret-xyz\n' | "$GS" set-client a --stdin >/dev/null 2>"$T/ou
     check "real config names Google" grep -q 'type = "google_calendar"' "$T/config/a/vdirsyncer.conf"
     refuse "no secret in the config" grep -q secret-xyz "$T/config/a/vdirsyncer.conf"
 } || { echo "skip secrets (systemd-creds --user does not work here)"; cat "$T/out"; }
+
+# ==================================================== help and usage errors ===
+for c in $("$GS" help | sed -nE 's/^  ([a-z][a-z-]+) .*/\1/p' | sort -u); do
+    out=$("$GS" "$c" --help 2>&1) && [[ $out == "usage: gcalendar-sync $c"* ]] && ok "$c --help" || fail "$c --help: $out"
+done
+is "every command is in the overview" "$("$GS" help | sed -nE 's/^  ([a-z][a-z-]+)( .*)?$/\1/p' | sort -u | paste -sd' ')" \
+    "$("$GS" nonsense 2>&1 | sed -n 's/^commands: //p' | tr ' ' '\n' | sort | paste -sd' ')"
+for a in "init -h" "init help" "help init" "init x --email a@b.c --help"; do
+    out=$("$GS" $a 2>&1) && [[ $out == *"usage: gcalendar-sync init ACCOUNT"*"--email ADDR"*"Example"* ]] && ok "$a" || fail "$a: $out"
+done
+refuse "help created no account" test -e "$GCALENDAR_SYNC_CONFIG/help"
+refuse "nor did --help" test -e "$GCALENDAR_SYNC_CONFIG/x"
+usage_error() { # DESCRIPTION EXPECTED ARGS...
+    local d=$1 want=$2 rc=0; shift 2
+    out=$(setsid -w "$GS" "$@" 2>&1 </dev/null) || rc=$?
+    [[ $rc == 2 && $out == *"$want"* && $out == *"usage: gcalendar-sync $1"* && $out == *"gcalendar-sync help $1"* ]] && ok "$d" || fail "$d ($rc): $out"
+}
+usage_error "init without a name" "needs a name" init
+usage_error "init without an address" "--email ADDR is required" init nomail
+usage_error "init with a bad address" "nope" init nomail --email nope
+usage_error "init with an option for a name" "usage" init --email a@b.c
+usage_error "init with a bad name" "invalid account name" init 'A b' --email a@b.c
+usage_error "option without a value" "--email needs a value" init nomail --email
+usage_error "unknown option" "unknown option '--nope'" init nomail --nope
+usage_error "sync without an account" "needs an account" sync
+refuse "unknown command" "$GS" synch
+check "no arguments: the overview" "$GS"
+
 (( fails == 0 )) && echo "all passed" || { echo "$fails failed"; exit 1; }

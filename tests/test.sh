@@ -165,8 +165,64 @@ usage_error "init with an option for a name" "usage" init --email a@b.c
 usage_error "init with a bad name" "invalid account name" init 'A b' --email a@b.c
 usage_error "option without a value" "--email needs a value" init nomail --email
 usage_error "unknown option" "unknown option '--nope'" init nomail --nope
-usage_error "sync without an account" "needs an account" sync
+usage_error "a command that cannot guess the account" "needs an account" history
+check "second account" "$GS" init second --email s@x.com
+usage_error "sync with two accounts" "needs an account" sync
 refuse "unknown command" "$GS" synch
-check "no arguments: the overview" "$GS"
+
+# ========================================================= guidance ===
+# Fresh homes; "signed in" needs no Google here, so a stand-in systemctl says what is enabled.
+mkdir -p "$T/bin"; printf '#!/bin/sh\ncase "$*" in *is-enabled*) test -e %s/enabled ;; *"enable --now"*) touch %s/enabled ;; esac\n' "$T" "$T" > "$T/bin/systemctl"; chmod +x "$T/bin/systemctl"
+export PATH=$T/bin:$PATH GCALENDAR_SYNC_CONFIG=$T/g/c GCALENDAR_SYNC_STATE=$T/g/s GCALENDAR_SYNC_CALENDARS=$T/g/cal GCALENDAR_SYNC_TEST_REMOTE=$T/g/google
+mkdir -p "$T/g/google/me@x.com" "$T/g/google/team@group"; echo -n 'Team; meetings' > "$T/g/google/team@group/displayname"
+for i in 1 2 3; do ev "$T/g/google/me@x.com" "m$i" "x"; ev "$T/g/google/team@group" "t$i" "x"; done
+says() { local d=$1 want=$2; shift 2; out=$("$@" 2>&1 </dev/null) || true; [[ $out == *"$want"* ]] && ok "$d" || fail "$d: $out"; }
+says "nothing yet: points to setup" "Next:  gcalendar-sync setup" "$GS"
+says "status too" "Next:  gcalendar-sync setup" "$GS" status
+says "an account command without accounts too" "gcalendar-sync setup" "$GS" sync
+says "setup without a terminal says so" "needs a terminal" "$GS" setup
+says "real Google: registration is next" "Next:  gcalendar-sync set-client b" env -u GCALENDAR_SYNC_TEST_REMOTE "$GS" init b --email a@b.c
+says "status shows what is missing" "[ ] registered with Google" env -u GCALENDAR_SYNC_TEST_REMOTE "$GS"
+mv "$T/g/c" "$T/g/c.old"
+pty() { python3 -c '
+import os,pty,select,sys,time
+answers=sys.argv[1].encode().decode("unicode_escape").split("|")
+pid,fd=pty.fork()
+if pid==0: os.execvp(sys.argv[2],sys.argv[2:])
+out=b""; end=time.time()+60; last=time.time()
+while time.time()<end:
+    if select.select([fd],[],[],0.2)[0]:
+        try: x=os.read(fd,4096)
+        except OSError: break
+        if not x: break
+        out+=x; last=time.time()
+    elif answers and time.time()-last>0.5 and out.rstrip().endswith(b":"):
+        os.write(fd,answers.pop(0).encode()+b"\n"); last=time.time()
+else: os.kill(pid,9)
+sys.stdout.write(out.decode(errors="replace").replace("\r",""))' "$@"; }
+# name | address (a wrong one first) | shared rw | calendars 9 (none such), 1, 2 | names, two-way | stop before the timers
+out=$(pty 'work|nope|me@x.com|w|9 1 2||n|team|y|n' "$GS" setup)
+[[ $out == *"not an address"*"no number '9'"* ]] && ok "setup checks answers" || fail "setup: $out"
+is "setup: one calendar of each kind" "$(grep -v '^#' "$T/g/c/work/calendars.conf" | awk '{print $2}' | sort | paste -sd' ')" "both pull"
+is "setup synced" "$(find "$T/g/cal/work" -name '*.ics' | wc -l)" 6
+is "setup: shared permissions" "$(sed -n 's/^FILE_MODE=//p' "$T/g/c/work/account.conf")" 660
+says "stopped before the timers: that is next" "Next:  gcalendar-sync enable-timers work" "$GS"
+out=$(pty 'y' "$GS" setup); [[ $out == *"Everything works; nothing to do."* ]] && ok "setup continues and finishes" || fail "continue: $out"
+says "all done" "Everything works" "$GS" status
+out=$(pty 'x' "$GS" setup); [[ $out == *"Everything works"* && $out != *"Google address"* ]] && ok "setup again asks nothing" || fail "again: $out"
+check "the only account may be left out" "$GS" sync
+C=$T/g/cal/work; D=$(awk '$2=="both"{print $1}' "$T/g/c/work/calendars.conf")
+ev "$C/$D" n1 x; check "sync an event" "$GS" sync; rm "$C/$D"/*.ics
+"$GS" sync >/dev/null 2>&1 || true
+says "a refused sync: the reason" "refusing to delete" "$GS" status
+says "... as a problem" "PROBLEM" "$GS" status
+says "... and what to do" "Next:  gcalendar-sync sync work" "$GS" status
+check "force" "$GS" sync --force
+says "fine again" "Everything works" "$GS" status
+touch -d '4 hours ago' "$T/g/s/work/last-failure"; touch -d '3 hours ago' "$T/g/s/work/last-sync"
+says "no sync for long" "no sync for 3 hours" "$GS" status
+touch "$T/g/s/work/signin-expired"
+says "expired sign-in" "Next:  gcalendar-sync authorize work" "$GS" status
+check "no arguments: exit 0" "$GS"
 
 (( fails == 0 )) && echo "all passed" || { echo "$fails failed"; exit 1; }

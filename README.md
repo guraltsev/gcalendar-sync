@@ -14,27 +14,23 @@ Google Calendar in folders of `.ics` files, synced by [vdirsyncer](https://vdirs
   vdirsyncer runs, in `$XDG_RUNTIME_DIR` (memory, only you).
 - **Change notes** for other programs, see below.
 
-## Google side, once
-
-`gcalendar-sync set-client ACCOUNT` explains the steps with links (project, CalDAV API, app, publish, *Desktop app* client)
-and asks for the file Google lets you download at the end.
-
-## Install and first sync
+## Start
 
 ```bash
 sudo dnf install vdirsyncer git
 ./gcalendar-sync install
-gcalendar-sync init personal --email you@gmail.com --file-mode 640 --dir-mode 750
-gcalendar-sync set-client personal          # explains the Google steps
-gcalendar-sync authorize personal           # browser sign-in; prints the calendars
-gcalendar-sync add personal main you@gmail.com
-gcalendar-sync add personal secretary ID@group.calendar.google.com both
-gcalendar-sync sync personal
-gcalendar-sync enable-timers personal
+gcalendar-sync setup
 ```
 
-`enable-timers` again after adding the first two-way calendar. `gcalendar-sync help` lists every command.
-A client secret or token is not in the backup: after losing `~/.config`, `recover`, then `set-client` and `authorize`.
+`setup` guides you through everything: the account, Google's registration (explained step by step, with links), the
+sign-in, choosing calendars, the first sync, the timers. Stop at any time; run it again to continue.
+
+Lost? `gcalendar-sync` alone (or `status`) shows which steps are done, what is wrong, and the command to run next.
+`gcalendar-sync help`, and `COMMAND --help`, for the rest. With one account its name may be left out.
+
+Each step as a command of its own: `init`, `set-client`, `authorize`, `add`, `sync`, `enable-timers`.
+After losing `~/.config`: `setup` again with the same account name; it continues the backup's history. The client and the
+sign-in are not in the backup.
 
 ## Files
 

@@ -820,6 +820,8 @@ sync_ended() {
     fi
     exit "$rc"
 }
+vd_sync() { vd "$RC" sync "$@" </dev/null 2>&1 | tee "$SD/last-output"; return "${PIPESTATUS[0]}"; }
+EMPTIED=()
 do_sync() {
     local force=$1 quick=$2 n rc=0 todo=() targets=() t0=$SECONDS
     if [[ $quick == yes ]]; then
@@ -848,7 +850,22 @@ do_sync() {
         vd "$RC" discover < <(yes n 2>/dev/null) || die "vdirsyncer could not find all the calendars (renamed or removed in Google?)"
         touch -- "$SD/discovered"
     fi
-    vd "$RC" sync "${args[@]}" "${targets[@]}" </dev/null 2>&1 | tee "$SD/last-output" || rc=${PIPESTATUS[0]}
+    vd_sync "${args[@]}" "${targets[@]}" || rc=$?
+    # vdirsyncer stops at a calendar that became completely empty. With a few events that is
+    # everyday life (the last one was deleted); what is deleted here is in the backup, and the
+    # deletion of many local events was refused above already.
+    local small=() x
+    while IFS= read -r x; do
+        n=${x#*/}; [[ -n ${CAL_ID[$n]:-} ]] || continue
+        if (( $(cat -- "$SD/count-$n" 2>/dev/null || echo 999) < 5 )); then small+=("$x")
+        else EMPTIED+=("$n"); fi
+    done < <(sed -nE 's/^.*((both|pull)\/[A-Za-z0-9_-]+): Storage .* was completely emptied.*$/\1/p' "$SD/last-output" | sort -u)
+    if (( rc != 0 && ${#small[@]} )); then
+        info "now empty: ${small[*]#*/}"
+        rc=0
+        vd_sync --force-delete "${small[@]}" || rc=$?
+        (( rc != 0 )) || vd_sync "${targets[@]}" || rc=$?
+    fi
     if (( rc != 0 )) && grep -qiE 'invalid_grant|expired or revoked' "$SD/last-output"; then
         warn "Google no longer accepts the sign-in"; touch -- "$SD/signin-expired"
     fi
@@ -861,6 +878,9 @@ do_sync() {
         ENDED=yes
         run_hooks post-sync 0 || true
         info "synced ${#todo[@]} calendars in $((SECONDS - t0))s"
+    elif (( ${#EMPTIED[@]} )); then
+        n=${EMPTIED[0]}
+        warn "$n is completely empty on one side (here: $(count_events "$CALENDARS/$n") events, last time: $(cat -- "$SD/count-$n" 2>/dev/null || echo ?)), so it was not synced. Look at it in Google. If it is meant to be empty: $PROG sync $ACCT --force (the backup keeps the events)"
     elif [[ ! -e $SD/signin-expired ]]; then
         warn "vdirsyncer failed: $(grep -m1 -E '^(error|critical):' "$SD/last-output" || echo "status $rc")"
     fi

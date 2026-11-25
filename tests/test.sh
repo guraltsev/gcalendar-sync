@@ -97,6 +97,22 @@ sed -i 's/^main both/main pull/' "$conf"; rm "$P/fromhere.ics"; check "regen to 
 refuse "a removal in Google is not undone" test -e "$P/fromhere.ics"; refuse "and arrives here" test -e "$L/main/fromhere.ics"
 is "Google as before" "$(ls "$P" | grep -c ics)" "$before"
 
+# ---- a calendar that becomes empty
+mkdir "$T/google/tiny@group"; ev "$T/google/tiny@group" only "Only one"
+check "add" "$GS" add a tiny tiny@group both; check "sync" "$GS" sync a
+rm "$T/google/tiny@group/only.ics"; check "the only event deleted in Google" "$GS" sync a
+refuse "is deleted here" test -e "$L/tiny/only.ics"; check "then quiet" "$GS" sync a
+ev "$L/tiny" mine2 x; check "quick" "$GS" sync a --quick; check "sent" test -f "$T/google/tiny@group/mine2.ics"
+rm "$L/tiny/mine2.ics"; check "the only event deleted here" "$GS" sync a --quick; refuse "is deleted in Google" test -e "$T/google/tiny@group/mine2.ics"
+ev "$L/tiny" mine3 x; "$GS" sync a >/dev/null 2>&1; rm "$T/google/tiny@group/mine3.ics"; sleep 0.1; ev "$L/tiny" mine3 "changed here meanwhile"
+check "deleted there, changed here" "$GS" sync a; check "the changed one comes back, others still sync" test -f "$T/google/tiny@group/mine3.ics"
+for i in 1 2 3 4 5 6; do ev "$T/google/tiny@group" "big$i" x; done; "$GS" sync a >/dev/null 2>&1
+rm "$T/google/tiny@group"/*.ics; refuse "many events gone at once: not synced" "$GS" sync a
+is "nothing deleted here" "$(ls "$L/tiny" | grep -c ics)" 7
+out=$("$GS" status a 2>&1); [[ $out == *"tiny is completely empty on one side"*"--force"* ]] && ok "status explains" || fail "status: $out"
+check "--force empties it" "$GS" sync a --force; is "emptied here" "$(ls "$L/tiny" | grep -c ics || true)" 0
+check "remove it again" "$GS" remove a tiny
+
 # ---- hooks, lock, move, remove, recover
 H=$T/config/a/hooks.d; mkdir -p "$H/post-sync" "$H/pre-sync" "$H/sync-failed"
 printf '#!/bin/sh\necho "$GCALENDAR_SYNC_ACCOUNT $GCALENDAR_SYNC_EVENT" > %s/hook\n' "$T" > "$H/post-sync/x"; chmod 700 "$H/post-sync/x"

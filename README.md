@@ -7,7 +7,10 @@ Google Calendar in folders of `.ics` files, synced by [vdirsyncer](https://vdirs
   calendars, and only the changed ones are synced. Files the sync itself wrote do not start another.
   Google's own changes are found by the 5-minute sync.
 - **Per calendar**: `pull` (the default) is read-only, local changes are undone by the next sync and never reach Google;
-  `both` is two-way. Conflict: Google's version stays, the local one is in the backup.
+  `both` is two-way. Changed on both sides: Google's version stays, the local one is in the backup. Deleted on one side and
+  changed on the other: the changed event comes back.
+- **Emptied calendar**: with fewer than 5 events it is simply emptied on the other side too; with more, that calendar is not
+  synced until you say so (`--force`).
 - **Guards**: a two-way calendar that lost more than 10% of its events (and at least 3), a missing folder, or an emptied
   calendar stops the sync (`--force` overrides). Calendars are never created or removed in Google.
 - **Secrets**: the OAuth client and token are encrypted with `systemd-creds --user`. The token is in plain text only while

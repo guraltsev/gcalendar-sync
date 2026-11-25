@@ -69,8 +69,238 @@ Scheduling (systemd --user)
   disable-timers ACCOUNT
   timers [ACCOUNT]
   log ACCOUNT [JOURNALCTL-ARGS...]
+
+Of one command:  gcalendar-sync help COMMAND   or   gcalendar-sync COMMAND --help
 EOT
 }
+
+# ------------------------------------------------------------ command help ---
+# One entry per command: its synopsis, then what it does.
+COMMANDS=(install uninstall init recover set-client authorize list-calendars add remove sync timers regen move accounts status backup history restore git maint enable-timers disable-timers log)
+command_help() {
+    case $1 in
+        install) cat <<'EOH'
+usage: gcalendar-sync install
+
+Install or upgrade for this user. Run it from a checkout: ./gcalendar-sync install
+EOH
+        ;;
+        uninstall) cat <<'EOH'
+usage: gcalendar-sync uninstall
+
+Turn the timers off and list the installed files to delete.
+Settings, data and backups are not among them.
+EOH
+        ;;
+        init) cat <<'EOH'
+usage: gcalendar-sync init ACCOUNT --email ADDR [OPTIONS]
+
+Create an account. ACCOUNT is a name you choose for it (a-z 0-9 _ -), not the address.
+Refuses a calendars folder with content and an existing backup (see: gcalendar-sync help recover).
+
+Options [default]:
+  --email ADDR           the Google address (asked for on a terminal when missing)
+  --calendars DIR        the live calendars folder            [~/Documents/Calendars/ACCOUNT]
+  --backup-git DIR       the backup repository         [~/Documents/Calendars/ACCOUNT.backup.git]
+  --backup-remote URL    git URL every backup is pushed to            [none]
+  --file-mode MODE       permissions of files, e.g. 640               [unchanged]
+  --dir-mode MODE        permissions of folders, e.g. 750             [unchanged]
+
+Example:
+  gcalendar-sync init personal --email you@gmail.com --file-mode 640 --dir-mode 750
+EOH
+        ;;
+        recover) cat <<'EOH'
+usage: gcalendar-sync recover ACCOUNT --email ADDR [OPTIONS]
+
+Set an account up again on data and a backup repository still on disk.
+
+Options [default]:
+  --email ADDR           the Google address (asked for on a terminal when missing)
+  --calendars DIR        the live calendars folder            [~/Documents/Calendars/ACCOUNT]
+  --backup-git DIR       the backup repository         [~/Documents/Calendars/ACCOUNT.backup.git]
+  --backup-remote URL    git URL every backup is pushed to            [none]
+  --file-mode MODE       permissions of files, e.g. 640               [unchanged]
+  --dir-mode MODE        permissions of folders, e.g. 750             [unchanged]
+EOH
+        ;;
+        set-client) cat <<'EOH'
+usage: gcalendar-sync set-client ACCOUNT [--stdin]
+
+Store the Google OAuth client id and secret, encrypted. Asks for both;
+  --stdin   read them from standard input, one per line
+How to create them: README, "Google side, once".
+EOH
+        ;;
+        authorize) cat <<'EOH'
+usage: gcalendar-sync authorize ACCOUNT
+
+Sign in to Google in the browser on this computer, then list the calendars.
+Needs set-client first. The token is stored encrypted.
+EOH
+        ;;
+        list-calendars) cat <<'EOH'
+usage: gcalendar-sync list-calendars ACCOUNT
+
+List the calendars Google offers: id and name.
+EOH
+        ;;
+        add) cat <<'EOH'
+usage: gcalendar-sync add ACCOUNT NAME ID [both|pull]
+
+Sync the calendar ID (from list-calendars) in the folder NAME.
+  pull   read-only: nothing is changed in Google (default)
+  both   two-way
+
+Example:
+  gcalendar-sync add personal main you@gmail.com
+EOH
+        ;;
+        remove) cat <<'EOH'
+usage: gcalendar-sync remove ACCOUNT NAME
+
+Stop syncing the calendar NAME. Its files, backup and Google calendar stay.
+EOH
+        ;;
+        sync) cat <<'EOH'
+usage: gcalendar-sync sync ACCOUNT [--force | --quick]
+
+Back up, sync every calendar, back up again.
+  --quick   only two-way calendars with local changes; none: do nothing
+  --force   override the mass-deletion guards
+EOH
+        ;;
+        timers) cat <<'EOH'
+usage: gcalendar-sync timers [ACCOUNT]
+
+Show the timers and the watch.
+EOH
+        ;;
+        regen) cat <<'EOH'
+usage: gcalendar-sync regen ACCOUNT
+
+Apply edits made to the settings in ~/.config/gcalendar-sync/ACCOUNT/.
+EOH
+        ;;
+        move) cat <<'EOH'
+usage: gcalendar-sync move ACCOUNT [--calendars DIR] [--backup-git DIR]
+
+Move the calendars and/or the backup repository and update the settings
+(or, if you moved them already, only the settings).
+EOH
+        ;;
+        accounts) cat <<'EOH'
+usage: gcalendar-sync accounts
+
+List the accounts.
+EOH
+        ;;
+        status) cat <<'EOH'
+usage: gcalendar-sync status [ACCOUNT]
+
+State of one account, or of all.
+EOH
+        ;;
+        backup) cat <<'EOH'
+usage: gcalendar-sync backup ACCOUNT
+
+Commit the current state now (and push).
+EOH
+        ;;
+        history) cat <<'EOH'
+usage: gcalendar-sync history ACCOUNT [N]
+
+List the last N backup commits (default 20).
+EOH
+        ;;
+        restore) cat <<'EOH'
+usage: gcalendar-sync restore ACCOUNT DEST [--at DATE | --rev REV]
+
+Export everything as it was into the new folder DEST.
+  --at DATE   the last backup before DATE, e.g. "2 days ago"
+  --rev REV   that commit (see: gcalendar-sync history ACCOUNT)
+EOH
+        ;;
+        git) cat <<'EOH'
+usage: gcalendar-sync git ACCOUNT ARGS...
+
+Run any git command on the backup repository.
+EOH
+        ;;
+        maint) cat <<'EOH'
+usage: gcalendar-sync maint ACCOUNT
+
+git gc, fsck and push of the backup repository.
+EOH
+        ;;
+        enable-timers) cat <<'EOH'
+usage: gcalendar-sync enable-timers ACCOUNT
+
+Sync every 5 minutes, quick sync when a local event changes, maintenance weekly.
+EOH
+        ;;
+        disable-timers) cat <<'EOH'
+usage: gcalendar-sync disable-timers ACCOUNT
+
+Turn that off.
+EOH
+        ;;
+        log) cat <<'EOH'
+usage: gcalendar-sync log ACCOUNT [JOURNALCTL-ARGS...]
+
+Open the journal at its end; -f follows it live, e.g. log ACCOUNT --since today
+EOH
+        ;;
+        *) return 1 ;;
+    esac
+}
+# bad_usage MSG — what is wrong, how the command is used, where to read more.
+bad_usage() {
+    warn "$*"
+    command_help "$CMD" | head -n 1 >&2 || true
+    printf 'more:  %s help %s\n' "$PROG" "$CMD" >&2
+    exit 2
+}
+# need_value OPTION [VALUE] — an option at the end of the line has no value.
+need_value() { (( $# > 1 )) && [[ -n $2 && $2 != --* ]] || bad_usage "$1 needs a value"; }
+no_more() { (( $# == 0 )) || bad_usage "unexpected argument '$1'"; }
+# ask_email — on a terminal, ask for a missing address; never for a wrong one.
+ask_email() {
+    [[ -z $EMAIL && -t 0 && -t 2 ]] || return 0
+    read -rp "Google address of '$ACCT': " EMAIL || true
+}
+# wants_help ARGS... — is help asked for? What follows "--", and what git and
+# journalctl get after the account, is not ours.
+wants_help() {
+    local a first=yes
+    for a in "$@"; do
+        case $a in
+            -h|--help) return 0 ;;
+            help) [[ $first != yes ]] || return 0 ;;
+            --) return 1 ;;
+        esac
+        case $CMD in git|log) return 1 ;; esac
+        first=no
+    done
+    return 1
+}
+run_command() {
+    CMD=${1:-help}; shift || true
+    case $CMD in
+        -h|--help|help)
+            [[ -n ${1:-} ]] || { usage; exit 0; }
+            command_help "$1" || { warn "there is no command '$1'"; printf 'commands: %s\n' "${COMMANDS[*]}" >&2; exit 2; }
+            exit 0 ;;
+    esac
+    if ! command_help "$CMD" >/dev/null; then
+        warn "there is no command '$CMD'"
+        printf 'commands: %s\nmore:     %s help [COMMAND]\n' "${COMMANDS[*]}" "$PROG" >&2
+        exit 2
+    fi
+    if wants_help "$@"; then command_help "$CMD"; exit 0; fi
+    "cmd_${CMD//-/_}" "$@"
+}
+
 
 # ---------------------------------------------------------------- settings ---
 abspath() { case $1 in /*) printf '%s' "$1" ;; "~"/*) printf '%s/%s' "$HOME" "${1#\~/}" ;; *) printf '%s/%s' "$PWD" "$1" ;; esac; }
@@ -81,10 +311,22 @@ cmd_accounts() {
     local d
     for d in "$CONF_ROOT"/*/; do [[ ! -f $d/account.conf ]] || basename -- "$d"; done
 }
+hint_accounts() {
+    local a; a=$(cmd_accounts | paste -sd' ' -)
+    if [[ -n $a ]]; then printf 'accounts: %s\n' "$a" >&2
+    else printf 'no accounts yet; create one: %s init NAME --email you@gmail.com\n' "$PROG" >&2; fi
+}
 need_account() {
-    if [[ -z ${1:-} || ! $1 =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
-        warn "give an account name (a-z 0-9 _ -); accounts: $(cmd_accounts | paste -sd' ' -)"
-        exit 1
+    if [[ -z ${1:-} || $1 == -* ]]; then
+        hint_accounts
+        case $CMD in
+            init|recover) bad_usage "$CMD needs a name for the account" ;;
+            *) bad_usage "$CMD needs an account" ;;
+        esac
+    fi
+    if [[ ! $1 =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
+        hint_accounts
+        bad_usage "invalid account name '$1' (use a-z 0-9 _ -, start alphanumeric)"
     fi
 }
 # A value that ends up in a generated config or unit must not break its syntax.
@@ -113,7 +355,7 @@ load_account() {
     need_account "${1:-}"
     ACCT=$1
     local f line key val; f=$(acct_dir "$ACCT")/account.conf
-    [[ -f $f ]] || die "there is no account '$ACCT'; accounts: $(cmd_accounts | paste -sd' ' -)"
+    [[ -f $f ]] || { warn "there is no account '$ACCT'"; hint_accounts; exit 1; }
     set_defaults
     while IFS= read -r line || [[ -n $line ]]; do
         [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
@@ -307,7 +549,7 @@ do_list() { trap token_close EXIT; token_open; discover_all; token_close; trap -
 
 cmd_add() {
     load_account "${1:-}"
-    [[ $# -ge 3 ]] || die "add ACCOUNT NAME ID [both|pull]"
+    [[ $# -ge 3 && $# -le 4 ]] || bad_usage "add needs a name and an id (see: $PROG list-calendars $ACCT)"
     local n=$2 i=$3 m=${4:-pull} k
     valid_calendar "$n" "$m" "$i"
     [[ -z ${CAL_ID[$n]:-} ]] || die "there is already a calendar '$n'"
@@ -319,7 +561,7 @@ cmd_add() {
 do_add() { NAMES+=("$1"); CAL_MODE[$1]=$2; CAL_ID[$1]=$3; write_calendars; generate_rc; }
 cmd_remove() {
     load_account "${1:-}"
-    [[ -n ${2:-} && -n ${CAL_ID[$2]:-} ]] || die "remove: no calendar '${2:-}'"
+    [[ -n ${2:-} && -n ${CAL_ID[$2]:-} ]] || bad_usage "${2:+there is no calendar '$2'; }calendars: ${NAMES[*]:-none}"
     with_lock 120 do_remove "$2"
     info "$2 is no longer synced; its files stay in $CALENDARS/$2"
 }
@@ -507,7 +749,7 @@ do_sync() {
 cmd_sync() {
     load_account "${1:-}"; shift
     local force=no quick=no
-    while (( $# )); do case $1 in --force) force=yes ;; --quick) quick=yes ;; *) die "sync: unknown argument '$1'" ;; esac; shift; done
+    while (( $# )); do case $1 in --force) force=yes ;; --quick) quick=yes ;; *) bad_usage "unknown argument '$1'" ;; esac; shift; done
     [[ -f $RC ]] || generate_rc
     if [[ $quick == yes ]]; then sleep "${GCALENDAR_SYNC_SETTLE:-2}"; with_lock 300 do_sync "$force" yes
     else with_lock 0 do_sync "$force" no; fi
@@ -518,16 +760,18 @@ setup_options() {
     set_defaults
     while (( $# )); do
         case $1 in
-            --email) EMAIL=${2:?} ;;
-            --calendars) CALENDARS=$(abspath "${2:?}") ;;
-            --backup-git) BACKUP_GIT=$(abspath "${2:?}") ;;
-            --backup-remote) BACKUP_REMOTE=${2:?} ;;
-            --file-mode) FILE_MODE=${2?} ;;
-            --dir-mode) DIR_MODE=${2?} ;;
-            *) die "$CMD: unknown option $1" ;;
+            --email) need_value "$@"; EMAIL=${2:?} ;;
+            --calendars) need_value "$@"; CALENDARS=$(abspath "${2:?}") ;;
+            --backup-git) need_value "$@"; BACKUP_GIT=$(abspath "${2:?}") ;;
+            --backup-remote) (( $# > 1 )) || bad_usage "--backup-remote needs a value"; BACKUP_REMOTE=${2:?} ;;
+            --file-mode) (( $# > 1 )) || bad_usage "--file-mode needs a value"; FILE_MODE=${2?} ;;
+            --dir-mode) (( $# > 1 )) || bad_usage "--dir-mode needs a value"; DIR_MODE=${2?} ;;
+            *) bad_usage "unknown option '$1'" ;;
         esac
         shift 2
     done
+    ask_email
+    valid_email "$EMAIL" || bad_usage "${EMAIL:+'$EMAIL' is not an address; }--email ADDR is required"
     validate_settings "$CMD"
     [[ ! -e $(acct_dir "$ACCT")/account.conf ]] || die "account '$ACCT' already exists"
 }
@@ -558,7 +802,7 @@ cmd_move() {
     load_account "${1:-}"; shift
     local nc=$CALENDARS nb=$BACKUP_GIT
     while (( $# )); do case $1 in
-        --calendars) nc=$(abspath "${2:?}") ;; --backup-git) nb=$(abspath "${2:?}") ;; *) die "move: unknown option $1" ;;
+        --calendars) need_value "$@"; nc=$(abspath "${2:?}") ;; --backup-git) need_value "$@"; nb=$(abspath "${2:?}") ;; *) bad_usage "unknown option '$1'" ;;
     esac; shift 2; done
     with_lock 600 do_move "${nc%/}" "${nb%/}"
 }
@@ -582,18 +826,18 @@ do_move() {
 
 # ------------------------------------------------------------------ backup ---
 cmd_backup() { load_account "${1:-}"; with_lock 600 backup_commit manual local; }
-cmd_history() { load_account "${1:-}"; [[ ${2:-20} =~ ^[0-9]+$ ]] || die "history: N must be a number"; g log -n "${2:-20}" --format='%h  %s'; }
+cmd_history() { load_account "${1:-}"; [[ ${2:-20} =~ ^[0-9]+$ ]] || bad_usage "N must be a number"; g log -n "${2:-20}" --format='%h  %s'; }
 cmd_git() { load_account "${1:-}"; shift; g "$@"; }
 cmd_restore() {
     load_account "${1:-}"; shift
     local dest= rev=main
     while (( $# )); do case $1 in
-        --at) rev=$(g rev-list -1 --before="${2:?}" main); [[ -n $rev ]] || die "no backup from before '$2'"; shift ;;
-        --rev) rev=${2:?}; shift ;;
-        -*) die "restore: unknown option $1" ;;
+        --at) need_value "$@"; rev=$(g rev-list -1 --before="${2:?}" main); [[ -n $rev ]] || die "no backup from before '$2'"; shift ;;
+        --rev) need_value "$@"; rev=${2:?}; shift ;;
+        -*) bad_usage "unknown option '$1'" ;;
         *) dest=$(abspath "$1") ;;
     esac; shift; done
-    [[ -n $dest ]] || die "restore: DEST directory required"
+    [[ -n $dest ]] || bad_usage "DEST, the new folder to restore into, is missing"
     case $dest/ in "$CALENDARS"/*) die "DEST must be outside the live calendars" ;; esac
     [[ -z $(ls -A -- "$dest" 2>/dev/null) ]] || die "$dest is not empty"
     g rev-parse --verify -q "$rev^{commit}" >/dev/null || die "unknown revision '$rev'"
@@ -685,10 +929,4 @@ cmd_uninstall() {
     printf '  %s\n' "$BIN_DIR/$PROG" "$BIN_DIR/$PROG-secret" "${UNITS[@]/#/$UNIT_DIR/}" "$UNIT_DIR/$PROG-watch@*.path.d/" "$DOC_DIR/"
 }
 
-CMD=${1:-help}; shift || true
-case $CMD in
-    init|recover|regen|move|accounts|add|remove|authorize|sync|backup|history|restore|git|maint|status|timers|log|install|uninstall) "cmd_$CMD" "$@" ;;
-    set-client|list-calendars|enable-timers|disable-timers) "cmd_${CMD//-/_}" "$@" ;;
-    help|-h|--help) usage ;;
-    *) usage >&2; exit 2 ;;
-esac
+run_command "$@"

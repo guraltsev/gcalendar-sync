@@ -616,8 +616,15 @@ cmd_authorize() {
 do_authorize() {
     [[ -n $TEST_REMOTE ]] || { ensure_private_dir "$RUN_ROOT"; ensure_private_dir "$RUN"; rm -f -- "$RUN/token.json" "$RUN/token.sum"; }
     trap token_close EXIT
-    info "your browser opens Google's sign-in. Google warns that it has not verified the app: it is yours; choose Advanced, then Go to ..."
-    info "a browser opens for the Google sign-in of $EMAIL (or open the printed address on THIS computer)"
+    cat >&2 <<EOT
+Your browser opens Google's sign-in; use $EMAIL. (Or open the address below on THIS computer.)
+
+  "Google hasn't verified this app"   expected, the app is your own: Advanced, then Go to ...
+  "Access blocked: ... has not completed the Google verification process"
+                                      the app is still in Testing. Press Ctrl-C here, then
+                                      Publish app at https://console.cloud.google.com/auth/audience
+                                      (check the project at the top) and run this again.
+EOT
     discover_all || die "the sign-in or the listing failed"
     token_close; trap - EXIT
     rm -f -- "$SD/signin-expired"
